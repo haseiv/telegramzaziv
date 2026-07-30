@@ -1,0 +1,18 @@
+# данные бота (пользователи по чатам) — не коммитим
+call_bot_data.json
+
+# секреты
+.env
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ide / os
+.idea/
+.vscode/
+.DS_Store
