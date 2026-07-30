@@ -40,7 +40,14 @@ from aiogram.types import Message
 
 TOKEN = os.getenv("BOT_TOKEN", "")
 
-DATA_FILE = Path(os.getenv("DATA_FILE", "call_bot_data.json"))
+# Куда писать данные. Многие хостинги дают персистентную папку через DATA_DIR
+# (переживает передеплой). Если её нет — пишем рядом со скриптом.
+_data_dir = os.getenv("DATA_DIR")
+if _data_dir:
+    Path(_data_dir).mkdir(parents=True, exist_ok=True)
+    DATA_FILE = Path(_data_dir) / os.getenv("DATA_FILE", "call_bot_data.json")
+else:
+    DATA_FILE = Path(os.getenv("DATA_FILE", "call_bot_data.json"))
 
 # слова-триггеры для текстовой команды (без слэша), в любом регистре
 CALL_TRIGGERS = {"калл", "call", "кол", "зов"}
@@ -103,7 +110,8 @@ def remember_user(chat_id: int, user) -> None:
 
 
 def mention_html(uid: str, name: str, emoji: str) -> str:
-    return f'{emoji} <a href="tg://user?id={uid}">{escape(name)}</a>'
+    # кликабельной ссылкой-упоминанием выступает сам эмодзи, ник не показываем
+    return f'<a href="tg://user?id={uid}">{emoji}</a>'
 
 
 # ─────────────────────────── бот ───────────────────────────
