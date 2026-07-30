@@ -31,6 +31,7 @@ from html import escape
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatType
 from aiogram.types import Message
@@ -107,7 +108,7 @@ def mention_html(uid: str, name: str, emoji: str) -> str:
 
 # ─────────────────────────── бот ───────────────────────────
 
-bot = Bot(token=TOKEN, parse_mode="HTML")
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 
