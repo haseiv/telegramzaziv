@@ -274,8 +274,19 @@ async def ping_chat(chat_id: int, header: str) -> None:
             await bot.send_message(chat_id, " ".join(chunk))
 
 
-def format_schedule_message(snap: ScheduleSnapshot, class_filter: str = "", *, days_ahead: int = 0) -> str:
-    return format_day_schedule(snap.text, class_filter=class_filter, days_ahead=days_ahead)
+def format_schedule_message(
+    snap: ScheduleSnapshot,
+    class_filter: str = "",
+    *,
+    days_ahead: int = 0,
+    week: bool | None = None,
+) -> str:
+    return format_day_schedule(
+        snap.text,
+        class_filter=class_filter,
+        days_ahead=days_ahead,
+        week=week,
+    )
 
 
 def evening_days_ahead(now=None) -> int:
@@ -369,7 +380,7 @@ async def send_daily_if_needed() -> None:
             await send_plain(
                 chat_id,
                 format_schedule_message(
-                    snap, sch.get("class_filter") or "", days_ahead=1
+                    snap, sch.get("class_filter") or "", days_ahead=1, week=False
                 ),
             )
         except Exception:
@@ -450,7 +461,8 @@ HELP_TEXT = (
     "  (например: <code>калл собираемся на созвон через 5 минут</code>)\n\n"
     "<b>Расписание СОШ №46</b> — бот сам ходит на сайт и пишет в группу:\n"
     "• с 8:00 каждые 2 часа (UTC+4) проверяет сайт; если что-то поменялось — зовёт всех и пишет изменения\n"
-    "• в 18:00 (UTC+4) присылает расписание на завтра\n"
+    "• в 18:00 (UTC+4) присылает расписание на завтра из обычной сетки (замены — только если их выложили)\n"
+    "• <code>класс 10А</code> — обычное расписание этого класса на неделю\n"
     "• <code>расписание</code> — показать расписание (после 18:00 UTC+4 — на завтра)\n"
     "• <code>изменения</code> — последний найденный дифф\n"
     "• <code>/schoolclass 8А</code> — (админ) присылать только этот класс\n"
@@ -605,21 +617,42 @@ async def cmd_schoolurl(message: Message, command: CommandObject):
     )
 
 
-@dp.message(Command("schoolclass"))
+async def apply_class_filter(message: Message, value: str) -> None:
+    value = (value or "").strip()
+    sch = chat_bucket(message.chat.id)["schedule"]
+    if not value:
+        current = sch.get("class_filter") or "не выбран"
+        await message.reply(
+            "Напишите <code>класс 10А</code> или <code>/schoolclass 10А</code>.\n"
+            f"Сейчас: {escape(str(current))}"
+        )
+        return
+    if value.lower() in {"все", "всё", "-", "нет"}:
+        sch["class_filter"] = ""
+        save_data(data)
+        await message.reply("Фильтр класса снят.")
+        return
+    sch["class_filter"] = value
+    save_data(data)
+    await refresh_schedule(message.chat.id, notify=False)
+    snap = ScheduleSnapshot.from_dict(
+        chat_bucket(message.chat.id)["schedule"].get("snapshot")
+    )
+    if not snap:
+        await message.reply("Не смог скачать расписание с сайта школы.")
+        return
+    await message.reply(
+        f"Класс <b>{escape(value)}</b>. Это обычное расписание на неделю. "
+        "Замены пришлю отдельно, когда их выложат."
+    )
+    for part in _chunk_text(format_schedule_message(snap, value, days_ahead=0)):
+        await message.reply(part)
+
+
+@dp.message(Command("schoolclass", "class", "класс"))
 async def cmd_schoolclass(message: Message, command: CommandObject):
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    if not await is_admin(message, message.from_user.id):
-        await message.reply("Только для админов.")
-        return
-    value = (command.args or "").strip()
-    sch = chat_bucket(message.chat.id)["schedule"]
-    sch["class_filter"] = value
-    sch["snapshot"] = None
-    save_data(data)
-    if value:
-        await message.reply(f"Буду выделять строки про класс <b>{escape(value)}</b>.")
-    else:
-        await message.reply("Фильтр класса снят — смотрю всё расписание на странице.")
+    await apply_class_filter(message, command.args or "")
 
 
 @dp.message(Command("schoolwatch"))
@@ -707,16 +740,30 @@ async def cmd_izmeneniya(message: Message):
         await message.reply(part)
 
 
-_rasp_re = re.compile(r"^/?(расписание|изменения)(?:@\w+)?\s*$", re.IGNORECASE)
+_rasp_re = re.compile(r"^/?(расписание|изменения)(?:@\w+)?(?:\s+(\S.*))?$", re.IGNORECASE)
+_class_re = re.compile(r"^/?(класс|class)(?:@\w+)?\s+(\S.*)$", re.IGNORECASE)
+
+@dp.message(F.text.regexp(_class_re))
+async def text_class(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    m = _class_re.match(message.text.strip())
+    args = m.group(2).strip() if m else ""
+    await apply_class_filter(message, args)
+
 
 @dp.message(F.text.regexp(_rasp_re))
 async def text_schedule(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    word = message.text.strip().lower()
+    m = _rasp_re.match(message.text.strip())
+    word = (m.group(1) if m else "").lower()
+    extra = (m.group(2) or "").strip() if m else ""
     if word == "изменения":
         await cmd_izmeneniya(message)
-    else:
-        await cmd_raspisanie(message)
+        return
+    if extra:
+        await apply_class_filter(message, extra)
+        return
+    await cmd_raspisanie(message)
 
 
 # ловим любой текст, чтобы запоминать людей (идёт последним)

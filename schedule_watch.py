@@ -315,21 +315,170 @@ def lessons_to_text(lessons: Iterable[Lesson]) -> str:
     return "\n".join(les.line() for les in lessons)
 
 
+LAT_TO_CYR = str.maketrans({
+    "a": "а",
+    "b": "б",
+    "v": "в",
+    "g": "г",
+    "d": "д",
+    "e": "е",
+    "k": "к",
+    "m": "м",
+    "h": "н",
+    "o": "о",
+    "p": "р",
+    "c": "с",
+    "t": "т",
+    "y": "у",
+    "x": "х",
+})
+DAY_PREPOS = {
+    "понедельник": "понедельник",
+    "вторник": "вторник",
+    "среда": "среду",
+    "четверг": "четверг",
+    "пятница": "пятницу",
+    "суббота": "субботу",
+    "воскресенье": "воскресенье",
+}
+
+
+def normalize_class_name(name: str) -> str:
+    s = _norm_space(name).lower().replace("ё", "е")
+    s = re.sub(r"[\s.\-]", "", s)
+    return s.translate(LAT_TO_CYR)
+
+
+def class_matches(actual: str, needle: str) -> bool:
+    if not needle:
+        return True
+    return normalize_class_name(actual) == normalize_class_name(needle)
+
+
+def is_changes_sheet(sheet: str) -> bool:
+    low = sheet.lower()
+    return "изменен" in low or "замен" in low
+
+
+def parse_lesson_line(line: str) -> tuple[str, str, str, str] | None:
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 4:
+        return None
+    return parts[0], parts[1], parts[2], " | ".join(parts[3:])
+
+
 def filter_lines_for_class(text: str, class_name: str) -> str:
+    """Оставляет только строки уроков выбранного класса (точное совпадение 10А / 10а / 10A)."""
     needle = _norm_space(class_name)
     if not needle:
         return text
-    variants = {
-        needle.lower(),
-        needle.lower().replace("а", "a").replace("б", "b").replace("в", "b"),
-        re.sub(r"[\s\-]", "", needle.lower()),
-    }
     kept: list[str] = []
     for line in text.splitlines():
-        compact = re.sub(r"[\s\-]", "", line.lower())
-        if any(v and (v in compact or v in line.lower()) for v in variants if v):
+        parsed = parse_lesson_line(line)
+        if parsed and class_matches(parsed[2], needle):
             kept.append(line)
-    return "\n".join(kept) if kept else text
+    return "\n".join(kept)
+
+
+def format_day_schedule(
+    text: str,
+    *,
+    class_filter: str = "",
+    now: datetime | None = None,
+    days_ahead: int = 0,
+    limit: int = 3500,
+    week: bool | None = None,
+) -> str:
+    """Стандартное расписание из таблиц 1–4 и 5–11. Замены — отдельным блоком, если они есть."""
+    if week is None:
+        week = bool(class_filter)
+    when = school_now(now) + timedelta(days=days_ahead)
+    want_days = [name.upper() for name in DAY_NAMES]
+    if not week:
+        want_days = [DAY_NAMES[when.weekday()].upper()]
+
+    parsed_rows: list[tuple[str, str, str, str]] = []
+    for line in text.splitlines():
+        parsed = parse_lesson_line(line)
+        if not parsed:
+            continue
+        sheet, day, klass, lesson = parsed
+        if class_filter and not class_matches(klass, class_filter):
+            continue
+        if day not in want_days:
+            continue
+        parsed_rows.append((sheet, day, klass, lesson))
+
+    standard = [row for row in parsed_rows if not is_changes_sheet(row[0])]
+    changes = [row for row in parsed_rows if is_changes_sheet(row[0])]
+
+    if week and class_filter:
+        header = f"📅 Расписание СОШ №46, класс {class_filter}"
+    elif class_filter:
+        day_name = DAY_NAMES[when.weekday()]
+        header = (
+            f"📅 Расписание СОШ №46 на {DAY_PREPOS[day_name]}, "
+            f"{when.strftime('%d.%m.%Y')} ({class_filter})"
+        )
+    else:
+        day_name = DAY_NAMES[when.weekday()]
+        header = (
+            f"📅 Расписание СОШ №46 на {DAY_PREPOS[day_name]}, "
+            f"{when.strftime('%d.%m.%Y')}"
+        )
+
+    if not standard and not changes:
+        hint = f" ({class_filter})" if class_filter else ""
+        return (
+            f"{header}\nВ стандартном расписании нет уроков{hint}. "
+            f"Проверьте написание класса (например 10А).\n"
+            f"{DEFAULT_SCHOOL_URL}"
+        )
+
+    chunks = [header]
+    if standard:
+        chunks.append("\nОсновное расписание:")
+        chunks.extend(_format_grouped_lessons(standard, by_day=week))
+    else:
+        chunks.append("\nОсновное расписание на сайте сейчас пустое.")
+
+    if changes:
+        chunks.append("\n⚠ Изменения (замены), если выложили:")
+        chunks.extend(_format_grouped_lessons(changes, by_day=True))
+    elif class_filter:
+        chunks.append("\nЗамен на сайте сейчас нет.")
+
+    body = "\n".join(chunks)
+    return body + f"\n\nИсточник: {DEFAULT_SCHOOL_URL}"
+
+
+def _format_grouped_lessons(
+    rows: list[tuple[str, str, str, str]],
+    *,
+    by_day: bool,
+) -> list[str]:
+    day_order = {name.upper(): i for i, name in enumerate(DAY_NAMES)}
+    grouped: dict[str, list[str]] = {}
+    keys: list[str] = []
+    for sheet, day, klass, lesson in rows:
+        if by_day:
+            key = f"{day} · {klass}"
+        else:
+            key = f"{klass} · {sheet}"
+        if key not in grouped:
+            grouped[key] = []
+            keys.append(key)
+        grouped[key].append(lesson)
+
+    def sort_key(key: str) -> tuple:
+        head = key.split(" · ", 1)[0]
+        return (day_order.get(head, 99), key)
+
+    out: list[str] = []
+    for key in sorted(keys, key=sort_key):
+        out.append(f"\n{key}")
+        out.extend(grouped[key])
+    return out
 
 
 def school_now(now: datetime | None = None) -> datetime:
@@ -386,46 +535,6 @@ def weekday_ru(now: datetime | None = None) -> str:
     return DAY_NAMES[school_now(now).weekday()].upper()
 
 
-def format_day_schedule(
-    text: str,
-    *,
-    class_filter: str = "",
-    now: datetime | None = None,
-    days_ahead: int = 0,
-    limit: int = 3500,
-) -> str:
-    when = school_now(now) + timedelta(days=days_ahead)
-    day = DAY_NAMES[when.weekday()].upper()
-    date = when.strftime("%d.%m.%Y")
-    lines = text.splitlines()
-    if class_filter:
-        lines = filter_lines_for_class("\n".join(lines), class_filter).splitlines()
-    today = [ln for ln in lines if f"| {day} |" in ln]
-    header = f"📅 Расписание СОШ №46 на {day.lower()}, {date}"
-    if class_filter:
-        header += f" ({class_filter})"
-    if not today:
-        return (
-            f"{header}\nПока в таблице нет уроков на этот день "
-            f"(каникулы или ещё не выложили).\n"
-            f"{DEFAULT_SCHOOL_URL}"
-        )
-    grouped: dict[str, list[str]] = {}
-    for ln in today:
-        parts = [p.strip() for p in ln.split("|")]
-        if len(parts) < 4:
-            continue
-        sheet, _day, klass, lesson = parts[0], parts[1], parts[2], " | ".join(parts[3:])
-        key = f"{klass} · {sheet}"
-        grouped.setdefault(key, []).append(lesson)
-    chunks = [header]
-    for key, items in grouped.items():
-        chunks.append(f"\n{key}")
-        chunks.extend(items)
-    body = "\n".join(chunks)
-    return body + f"\n\nИсточник: {DEFAULT_SCHOOL_URL}"
-
-
 def sheet_title_from_page(page_url: str, fallback: str = "Расписание") -> str:
     path = urlparse(page_url).path.lower()
     if "1-4" in path:
@@ -456,7 +565,6 @@ def build_snapshot_text(page_url: str, html: str, class_filter: str = "") -> tup
         parts.append("Таблицы Google:")
         parts.extend(f"- {name}: {url}" for url, name in iframes)
     text = "\n".join(parts)
-    text = filter_lines_for_class(text, class_filter)
     text = "\n".join(_norm_space(line) for line in text.splitlines() if _norm_space(line))
     return text[:MAX_TEXT_CHARS], pages, files, iframes
 
@@ -632,8 +740,6 @@ async def collect_schedule(
                 texts.append(body[:4000])
 
         lesson_text = lessons_to_text(all_lessons)
-        if class_filter:
-            lesson_text = filter_lines_for_class(lesson_text, class_filter)
         if lesson_text:
             texts.insert(0, lesson_text)
 
