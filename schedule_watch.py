@@ -340,6 +340,48 @@ def school_now(now: datetime | None = None) -> datetime:
     return now.astimezone(SCHOOL_TZ)
 
 
+def parse_hours(start_hour: int = 8, every_hours: int = 2, end_hour: int = 22) -> tuple[int, ...]:
+    if every_hours < 1:
+        every_hours = 1
+    return tuple(range(start_hour, end_hour + 1, every_hours))
+
+
+def last_due_parse_slot(
+    now: datetime | None = None,
+    *,
+    start_hour: int = 8,
+    every_hours: int = 2,
+    end_hour: int = 22,
+) -> datetime | None:
+    """Последний слот проверки, который уже наступил сегодня (8:00, 10:00, …)."""
+    now = school_now(now)
+    hours = parse_hours(start_hour, every_hours, end_hour)
+    due: datetime | None = None
+    for hour in hours:
+        slot = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if slot <= now:
+            due = slot
+    return due
+
+
+def next_parse_at(
+    now: datetime | None = None,
+    *,
+    start_hour: int = 8,
+    every_hours: int = 2,
+    end_hour: int = 22,
+) -> datetime:
+    """Следующий слот строго в будущем."""
+    now = school_now(now)
+    hours = parse_hours(start_hour, every_hours, end_hour)
+    for hour in hours:
+        slot = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if slot > now:
+            return slot
+    tomorrow = now + timedelta(days=1)
+    return tomorrow.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+
+
 def weekday_ru(now: datetime | None = None) -> str:
     return DAY_NAMES[school_now(now).weekday()].upper()
 

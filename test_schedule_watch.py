@@ -10,7 +10,10 @@ from schedule_watch import (
     fingerprint_of,
     format_day_schedule,
     google_sheets_csv_url,
+    last_due_parse_slot,
+    next_parse_at,
     parse_timetable_csv,
+    parse_hours,
 )
 
 HOME_HTML = """
@@ -154,6 +157,34 @@ class ScheduleParseTests(unittest.TestCase):
         report = describe_changes(old, new)
         self.assertIsNotNone(report)
         self.assertIn("обновил", report.lower())
+
+    def test_parse_hours_from_eight_every_two(self):
+        self.assertEqual(parse_hours(), (8, 10, 12, 14, 16, 18, 20, 22))
+
+    def test_slots_before_eight_wait_until_eight(self):
+        tz = timezone(timedelta(hours=4))
+        early = datetime(2026, 8, 27, 7, 30, tzinfo=tz)
+        self.assertIsNone(last_due_parse_slot(early))
+        nxt = next_parse_at(early)
+        self.assertEqual(nxt.hour, 8)
+        self.assertEqual(nxt.day, 27)
+
+    def test_slots_midday_then_two_hours(self):
+        tz = timezone(timedelta(hours=4))
+        now = datetime(2026, 8, 27, 9, 15, tzinfo=tz)
+        due = last_due_parse_slot(now)
+        self.assertEqual(due.hour, 8)
+        nxt = next_parse_at(now)
+        self.assertEqual(nxt.hour, 10)
+
+    def test_slots_after_last_go_to_tomorrow_eight(self):
+        tz = timezone(timedelta(hours=4))
+        late = datetime(2026, 8, 27, 23, 10, tzinfo=tz)
+        due = last_due_parse_slot(late)
+        self.assertEqual(due.hour, 22)
+        nxt = next_parse_at(late)
+        self.assertEqual(nxt.day, 28)
+        self.assertEqual(nxt.hour, 8)
 
 
 if __name__ == "__main__":

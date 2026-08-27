@@ -58,6 +58,8 @@ from schedule_watch import (
     collect_schedule,
     describe_changes,
     format_day_schedule,
+    last_due_parse_slot,
+    next_parse_at,
     school_now,
 )
 
@@ -67,7 +69,9 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 SCHOOL_URL = (os.getenv("SCHOOL_URL", "") or DEFAULT_SCHOOL_URL).strip()
 SCHOOL_CLASS = os.getenv("SCHOOL_CLASS", "").strip()
 SCHOOL_INSECURE_SSL = os.getenv("SCHOOL_INSECURE_SSL", "").strip() in {"1", "true", "yes"}
-SCHEDULE_POLL_SECONDS = max(60, int(os.getenv("SCHEDULE_POLL_SECONDS", "600")))
+SCHEDULE_PARSE_START_HOUR = int(os.getenv("SCHEDULE_PARSE_START_HOUR", "8"))
+SCHEDULE_PARSE_EVERY_HOURS = max(1, int(os.getenv("SCHEDULE_PARSE_EVERY_HOURS", "2")))
+SCHEDULE_PARSE_END_HOUR = int(os.getenv("SCHEDULE_PARSE_END_HOUR", "22"))
 DAILY_HOUR = int(os.getenv("SCHEDULE_DAILY_HOUR", "18"))
 
 # Куда писать данные. Многие хостинги дают персистентную папку через DATA_DIR
@@ -143,6 +147,7 @@ def chat_bucket(chat_id: int) -> dict:
 def meta_bucket() -> dict:
     bucket = data.setdefault("_meta", {})
     bucket.setdefault("last_daily", "")
+    bucket.setdefault("last_parse_slot", "")
     return bucket
 
 
@@ -371,30 +376,53 @@ async def send_daily_if_needed() -> None:
             log.exception("Не отправил вечернее расписание в %s", key)
 
 
+async def check_all_chats() -> None:
+    for key, bucket in list(data.items()):
+        if key == "_meta" or not isinstance(bucket, dict):
+            continue
+        if not watching(bucket):
+            continue
+        url = (bucket.get("schedule") or {}).get("url") or SCHOOL_URL
+        if not url:
+            continue
+        try:
+            chat_id = int(key)
+        except ValueError:
+            continue
+        try:
+            await refresh_schedule(chat_id, notify=True)
+        except Exception:
+            log.exception("Проверка расписания для чата %s упала", key)
+
+
+def _parse_slot_kwargs() -> dict:
+    return {
+        "start_hour": SCHEDULE_PARSE_START_HOUR,
+        "every_hours": SCHEDULE_PARSE_EVERY_HOURS,
+        "end_hour": SCHEDULE_PARSE_END_HOUR,
+    }
+
+
 async def schedule_loop() -> None:
-    await asyncio.sleep(15)
     while True:
         try:
-            for key, bucket in list(data.items()):
-                if key == "_meta" or not isinstance(bucket, dict):
-                    continue
-                if not watching(bucket):
-                    continue
-                url = (bucket.get("schedule") or {}).get("url") or SCHOOL_URL
-                if not url:
-                    continue
-                try:
-                    chat_id = int(key)
-                except ValueError:
-                    continue
-                try:
-                    await refresh_schedule(chat_id, notify=True)
-                except Exception:
-                    log.exception("Проверка расписания для чата %s упала", key)
-            await send_daily_if_needed()
+            now = school_now()
+            due = last_due_parse_slot(now, **_parse_slot_kwargs())
+            meta = meta_bucket()
+            slot_id = due.strftime("%Y-%m-%dT%H") if due else ""
+            if slot_id and meta.get("last_parse_slot") != slot_id:
+                log.info("Проверяю сайт школы, слот %s", slot_id)
+                await check_all_chats()
+                await send_daily_if_needed()
+                meta["last_parse_slot"] = slot_id
+                save_data(data)
+            nxt = next_parse_at(school_now(), **_parse_slot_kwargs())
+            delay = max(1.0, (nxt - school_now()).total_seconds() + 1)
+            log.info("Следующая проверка сайта в %s (через %.0f мин)", nxt.isoformat(), delay / 60)
+            await asyncio.sleep(delay)
         except Exception:
             log.exception("Цикл проверки расписания")
-        await asyncio.sleep(SCHEDULE_POLL_SECONDS)
+            await asyncio.sleep(60)
 
 
 # ── /call [текст] ──
@@ -421,9 +449,9 @@ HELP_TEXT = (
     "• <code>калл ТЕКСТ</code> — позвать всех и показать этот текст\n"
     "  (например: <code>калл собираемся на созвон через 5 минут</code>)\n\n"
     "<b>Расписание СОШ №46</b> — бот сам ходит на сайт и пишет в группу:\n"
-    "• вечером в 18:00 (UTC+4) присылает расписание на завтра\n"
-    "• если на сайте поменялись уроки или замены — зовёт всех и пишет, что изменилось\n"
-    "• <code>расписание</code> — показать расписание на сегодня прямо сейчас\n"
+    "• с 8:00 каждые 2 часа (UTC+4) проверяет сайт; если что-то поменялось — зовёт всех и пишет изменения\n"
+    "• в 18:00 (UTC+4) присылает расписание на завтра\n"
+    "• <code>расписание</code> — показать расписание (после 18:00 UTC+4 — на завтра)\n"
     "• <code>изменения</code> — последний найденный дифф\n"
     "• <code>/schoolclass 8А</code> — (админ) присылать только этот класс\n"
     "• <code>/schoolstop</code> — (админ) выключить автосообщения\n"
