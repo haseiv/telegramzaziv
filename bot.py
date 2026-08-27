@@ -50,7 +50,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatType
-from aiogram.types import ChatMemberUpdated, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import ChatMemberUpdated, Message, ReplyKeyboardRemove
 
 from schedule_watch import (
     DEFAULT_SCHOOL_URL,
@@ -97,24 +97,9 @@ DEFAULT_EMOJI_POOL = [
     "🍀", "💎", "🌸", "🎸", "👾", "🥷", "🧊", "🌊", "🍕", "🦁",
 ]
 
-BTN_TODAY = "Сегодня"
-BTN_TOMORROW = "Завтра"
-BTN_WEEK = "Неделя"
-BTN_SUBS = "Замены"
-BTN_BELLS = "Звонки"
-
-
-def schedule_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW)],
-            [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_SUBS)],
-            [KeyboardButton(text=BTN_BELLS), KeyboardButton(text="калл")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="класс 10А  ·  Сегодня  ·  калл",
-    )
+DEFAULT_CALL_TEXT = "📣 Общий сбор! Все сюда:"
+SCHEDULE_CHANGE_HEADER = "📢 Изменения в расписании школы:"
+HIDE_KEYBOARD = ReplyKeyboardRemove()
 
 # сколько упоминаний в одном сообщении (Telegram не любит очень длинные)
 MENTIONS_PER_MESSAGE = 30
@@ -321,12 +306,12 @@ def evening_days_ahead(now=None) -> int:
     return 1 if school_now(now).hour >= DAILY_HOUR else 0
 
 
-async def send_plain(chat_id: int, text: str, reply_markup=None) -> None:
+async def send_plain(chat_id: int, text: str) -> None:
     parts = _chunk_text(text)
     for i, part in enumerate(parts):
         kwargs = {}
-        if reply_markup is not None and i == len(parts) - 1:
-            kwargs["reply_markup"] = reply_markup
+        if i == len(parts) - 1:
+            kwargs["reply_markup"] = HIDE_KEYBOARD
         await bot.send_message(chat_id, part, **kwargs)
 
 
@@ -363,12 +348,12 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
         if notify and watching(bucket):
             klass = sch.get("class_filter") or ""
             if klass:
-                await send_plain(chat_id, schedule_msg, reply_markup=schedule_keyboard())
+                await send_plain(chat_id, schedule_msg)
             else:
                 await send_plain(
                     chat_id,
-                    "Слежу за сайтом СОШ №46. Напишите <code>класс 10А</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя.",
-                    reply_markup=schedule_keyboard(),
+                    "Слежу за сайтом СОШ №46. Напишите <code>класс 10А</code>. "
+                    "Потом словами: сегодня, завтра, неделя, замены, звонки.",
                 )
             return "Запомнил расписание. Дальше напишу сам, если появятся замены."
         return "Снял первый снимок обычного расписания. Замены пришлю, когда их выложат.\n" + schedule_msg
@@ -386,7 +371,7 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
         today = format_schedule_message(
             snap, sch.get("class_filter") or "", days_ahead=0, week=False
         )
-        await send_plain(chat_id, today, reply_markup=schedule_keyboard())
+        await send_plain(chat_id, today)
         return "Нашёл изменения на сайте и написал в чат."
     return report + "\n\n" + schedule_msg
 
@@ -424,7 +409,6 @@ async def send_daily_if_needed() -> None:
                 format_schedule_message(
                     snap, sch.get("class_filter") or "", days_ahead=1, week=False
                 ),
-                reply_markup=schedule_keyboard(),
             )
         except Exception:
             log.exception("Не отправил вечернее расписание в %s", key)
@@ -461,7 +445,6 @@ async def send_morning_if_needed() -> None:
                 + format_schedule_message(
                     snap, sch.get("class_filter") or "", days_ahead=0, week=False
                 ),
-                reply_markup=schedule_keyboard(),
             )
         except Exception:
             log.exception("Не отправил утреннее расписание в %s", key)
@@ -542,7 +525,7 @@ async def text_call(message: Message):
 HELP_TEXT = (
     "<b>Зазывалкин</b>\n\n"
     "• <code>калл</code> — позвать всех\n"
-    "• кнопки внизу: Сегодня, Завтра, Неделя, Замены, Звонки\n"
+    "• словами: сегодня / завтра / неделя / замены / звонки\n"
     "• <code>класс 10А</code> — обычная сетка этого класса (можно <code>10А, 10Б</code>)\n"
     "• утром в 7:30 (UTC+4) — расписание на сегодня\n"
     "• в 18:00 (UTC+4) — расписание на завтра\n"
@@ -558,7 +541,7 @@ HELP_TEXT = (
 @dp.message(Command("start", "help"))
 async def cmd_help(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    await message.reply(HELP_TEXT, reply_markup=schedule_keyboard())
+    await message.reply(HELP_TEXT, reply_markup=HIDE_KEYBOARD)
 
 
 @dp.message(Command("join"))
@@ -720,8 +703,10 @@ async def apply_class_filter(message: Message, value: str) -> None:
         f"Класс <b>{escape(value)}</b>. Это обычное расписание на неделю. "
         "Замены пришлю отдельно, когда их выложат."
     )
-    for part in _chunk_text(format_schedule_message(snap, value, days_ahead=0)):
-        await message.reply(part, reply_markup=schedule_keyboard())
+    chunks = _chunk_text(format_schedule_message(snap, value, days_ahead=0))
+    for i, part in enumerate(chunks):
+        kwargs = {"reply_markup": HIDE_KEYBOARD} if i == len(chunks) - 1 else {}
+        await message.reply(part, **kwargs)
 
 
 @dp.message(Command("schoolclass", "class", "класс"))
@@ -789,8 +774,10 @@ async def reply_schedule_view(message: Message, *, days_ahead: int = 0, week: bo
         await message.reply("Пока нет снимка с сайта. Напишите <code>класс 10А</code>.")
         return
     text = format_schedule_message(snap, klass, days_ahead=days_ahead, week=week)
-    for part in _chunk_text(text):
-        await message.reply(part, reply_markup=schedule_keyboard())
+    chunks = _chunk_text(text)
+    for i, part in enumerate(chunks):
+        kwargs = {"reply_markup": HIDE_KEYBOARD} if i == len(chunks) - 1 else {}
+        await message.reply(part, **kwargs)
 
 
 @dp.message(Command("расписание", "raspisanie", "schedule", "today", "сегодня"))
@@ -816,7 +803,7 @@ async def cmd_bells(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
     snap, _klass = await ensure_snapshot(message.chat.id)
     bells = snap.bells if snap else ""
-    await message.reply(format_bells(bells), reply_markup=schedule_keyboard())
+    await message.reply(format_bells(bells), reply_markup=HIDE_KEYBOARD)
 
 
 @dp.message(Command("изменения", "izmeneniya", "changes", "замены"))
@@ -827,15 +814,17 @@ async def cmd_izmeneniya(message: Message):
     if not diff:
         await message.reply(
             "Замен на сайте сейчас нет — действует обычное расписание.",
-            reply_markup=schedule_keyboard(),
+            reply_markup=HIDE_KEYBOARD,
         )
         return
     when = sch.get("last_change") or ""
     text = f"{SCHEDULE_CHANGE_HEADER}\n{diff}"
     if when:
         text += f"\n\nЗафиксировано: {when}"
-    for part in _chunk_text(text):
-        await message.reply(part, reply_markup=schedule_keyboard())
+    chunks = _chunk_text(text)
+    for i, part in enumerate(chunks):
+        kwargs = {"reply_markup": HIDE_KEYBOARD} if i == len(chunks) - 1 else {}
+        await message.reply(part, **kwargs)
 
 
 _btn_re = re.compile(r"^(сегодня|завтра|неделя|замены|звонки)$", re.IGNORECASE)
@@ -901,8 +890,9 @@ async def bot_membership(event: ChatMemberUpdated):
     try:
         await bot.send_message(
             event.chat.id,
-            "Я Зазывалкин. Напишите <code>класс 10А</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя, Замены, Звонки.",
-            reply_markup=schedule_keyboard(),
+            "Я Зазывалкин. Напишите <code>класс 10А</code>. "
+            "Потом словами: сегодня, завтра, неделя, замены, звонки.",
+            reply_markup=HIDE_KEYBOARD,
         )
         await refresh_schedule(event.chat.id, notify=False)
     except Exception:
