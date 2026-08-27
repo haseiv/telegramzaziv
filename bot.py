@@ -1,10 +1,17 @@
 """
-Telegram-бот «Калл» — зовёт всех участников чата по текстовой команде.
+Telegram-бот «Зазывалкин» — зовёт участников чата и следит за школьным расписанием.
 
 Главное:
     калл                 — тегнуть всех с заголовком по умолчанию
     калл ТЕКСТ           — тегнуть всех и показать этот ТЕКСТ
     (то же для /call и слова "call")
+
+Расписание школы:
+    /расписание          — что сейчас на сайте
+    /изменения           — последние найденные изменения
+    /schoolurl URL       — (админ) адрес школьного сайта
+    /schoolwatch         — (админ) слать в этот чат, когда расписание меняется
+    /schoolcheck         — (админ) проверить сайт прямо сейчас
 
 Возможности:
     • у каждого свой эмодзи-идентификатор рядом с упоминанием
@@ -24,21 +31,48 @@ Telegram-бот «Калл» — зовёт всех участников чат
 
 import asyncio
 import json
+import logging
 import os
 import random
 import re
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatType
-from aiogram.types import Message
+from aiogram.types import ChatMemberUpdated, Message
+
+from schedule_watch import (
+    DEFAULT_SCHOOL_URL,
+    ScheduleSnapshot,
+    collect_schedule,
+    describe_changes,
+    format_day_schedule,
+    last_due_parse_slot,
+    next_parse_at,
+    school_now,
+)
 
 # ─────────────────────────── настройки ───────────────────────────
 
 TOKEN = os.getenv("BOT_TOKEN", "")
+SCHOOL_URL = (os.getenv("SCHOOL_URL", "") or DEFAULT_SCHOOL_URL).strip()
+SCHOOL_CLASS = os.getenv("SCHOOL_CLASS", "").strip()
+SCHOOL_INSECURE_SSL = os.getenv("SCHOOL_INSECURE_SSL", "").strip() in {"1", "true", "yes"}
+SCHEDULE_PARSE_START_HOUR = int(os.getenv("SCHEDULE_PARSE_START_HOUR", "8"))
+SCHEDULE_PARSE_EVERY_HOURS = max(1, int(os.getenv("SCHEDULE_PARSE_EVERY_HOURS", "2")))
+SCHEDULE_PARSE_END_HOUR = int(os.getenv("SCHEDULE_PARSE_END_HOUR", "22"))
+DAILY_HOUR = int(os.getenv("SCHEDULE_DAILY_HOUR", "18"))
 
 # Куда писать данные. Многие хостинги дают персистентную папку через DATA_DIR
 # (переживает передеплой). Если её нет — пишем рядом со скриптом.
@@ -59,9 +93,14 @@ DEFAULT_EMOJI_POOL = [
 ]
 
 DEFAULT_CALL_TEXT = "📣 Общий сбор! Все сюда:"
+SCHEDULE_CHANGE_HEADER = "📢 Изменения в расписании школы:"
 
 # сколько упоминаний в одном сообщении (Telegram не любит очень длинные)
 MENTIONS_PER_MESSAGE = 30
+TELEGRAM_TEXT_LIMIT = 3500
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("zazyvalkin")
 
 # ─────────────────────────── хранилище ───────────────────────────
 
@@ -87,17 +126,50 @@ def chat_bucket(chat_id: int) -> dict:
         data[key] = {"call_text": DEFAULT_CALL_TEXT, "users": {}}
     data[key].setdefault("call_text", DEFAULT_CALL_TEXT)
     data[key].setdefault("users", {})
+    data[key].setdefault("chat_type", "")
+    data[key].setdefault("schedule", {})
+    sch = data[key]["schedule"]
+    sch.setdefault("url", SCHOOL_URL)
+    if not sch.get("url"):
+        sch["url"] = SCHOOL_URL
+    sch.setdefault("stopped", False)
+    sch.setdefault("watch", not sch.get("stopped"))
+    sch.setdefault("class_filter", SCHOOL_CLASS)
+    sch.setdefault("snapshot", None)
+    sch.setdefault("last_check", None)
+    sch.setdefault("last_change", None)
+    sch.setdefault("last_diff", "")
+    sch.setdefault("last_error", "")
+    sch.setdefault("last_daily", "")
     return data[key]
+
+
+def meta_bucket() -> dict:
+    bucket = data.setdefault("_meta", {})
+    bucket.setdefault("last_daily", "")
+    bucket.setdefault("last_parse_slot", "")
+    return bucket
+
+
+def watching(bucket: dict) -> bool:
+    if bucket.get("schedule", {}).get("stopped"):
+        return False
+    chat_type = bucket.get("chat_type")
+    if chat_type in (ChatType.GROUP, ChatType.SUPERGROUP, "group", "supergroup"):
+        return True
+    return bool(bucket.get("schedule", {}).get("watch"))
 
 
 def display_name(user) -> str:
     return user.full_name or user.first_name or "user"
 
 
-def remember_user(chat_id: int, user) -> None:
+def remember_user(chat_id: int, user, chat_type: str | None = None) -> None:
     if user is None or user.is_bot:
         return
     bucket = chat_bucket(chat_id)
+    if chat_type:
+        bucket["chat_type"] = chat_type
     uid = str(user.id)
     if uid not in bucket["users"]:
         bucket["users"][uid] = {
@@ -112,6 +184,30 @@ def remember_user(chat_id: int, user) -> None:
 def mention_html(uid: str, name: str, emoji: str) -> str:
     # кликабельной ссылкой-упоминанием выступает сам эмодзи, ник не показываем
     return f'<a href="tg://user?id={uid}">{emoji}</a>'
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _chunk_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    buf: list[str] = []
+    size = 0
+    for line in text.splitlines():
+        add = len(line) + 1
+        if buf and size + add > limit:
+            parts.append("\n".join(buf))
+            buf = [line]
+            size = add
+        else:
+            buf.append(line)
+            size += add
+    if buf:
+        parts.append("\n".join(buf))
+    return parts or [text[:limit]]
 
 
 # ─────────────────────────── бот ───────────────────────────
@@ -153,10 +249,186 @@ async def do_call(message: Message, custom_text: str | None = None):
         await message.answer(prefix + " ".join(chunk))
 
 
+async def ping_chat(chat_id: int, header: str) -> None:
+    bucket = chat_bucket(chat_id)
+    users = bucket["users"]
+    mentions = [
+        mention_html(uid, u["name"], u.get("emoji", "•"))
+        for uid, u in users.items()
+    ]
+    safe_header = escape(header)
+    if not mentions:
+        for part in _chunk_text(safe_header):
+            await bot.send_message(chat_id, part)
+        return
+    first = True
+    for i in range(0, len(mentions), MENTIONS_PER_MESSAGE):
+        chunk = mentions[i : i + MENTIONS_PER_MESSAGE]
+        if first:
+            parts = _chunk_text(safe_header)
+            for j, part in enumerate(parts):
+                suffix = "\n" + " ".join(chunk) if j == len(parts) - 1 else ""
+                await bot.send_message(chat_id, part + suffix)
+            first = False
+        else:
+            await bot.send_message(chat_id, " ".join(chunk))
+
+
+def format_schedule_message(snap: ScheduleSnapshot, class_filter: str = "", *, days_ahead: int = 0) -> str:
+    return format_day_schedule(snap.text, class_filter=class_filter, days_ahead=days_ahead)
+
+
+def evening_days_ahead(now=None) -> int:
+    """После 18:00 UTC+4 шлём уже завтрашнее расписание — его выкладывают вечером."""
+    return 1 if school_now(now).hour >= DAILY_HOUR else 0
+
+
+async def send_plain(chat_id: int, text: str) -> None:
+    for part in _chunk_text(text):
+        await bot.send_message(chat_id, part)
+
+
+async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
+    bucket = chat_bucket(chat_id)
+    sch = bucket["schedule"]
+    url = (sch.get("url") or SCHOOL_URL or "").strip()
+    if not url:
+        return "Сайт школы ещё не задан."
+    try:
+        snap = await collect_schedule(
+            url,
+            class_filter=sch.get("class_filter") or "",
+            insecure_ssl=SCHOOL_INSECURE_SSL,
+        )
+    except Exception as exc:
+        sch["last_check"] = _now_iso()
+        sch["last_error"] = str(exc)
+        save_data(data)
+        log.exception("Не удалось скачать расписание %s", url)
+        return f"Не смог открыть сайт школы: {escape(str(exc))}"
+
+    old = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+    diff = describe_changes(old, snap)
+    sch["last_check"] = _now_iso()
+    sch["last_error"] = ""
+    sch["snapshot"] = snap.to_dict()
+    schedule_msg = format_schedule_message(
+        snap, sch.get("class_filter") or "", days_ahead=evening_days_ahead()
+    )
+
+    if old is None:
+        save_data(data)
+        if notify and watching(bucket):
+            await send_plain(chat_id, schedule_msg)
+            return "Снял расписание с сайта школы и отправил в чат. Дальше сам буду писать, если что-то изменится."
+        return "Снял первый снимок расписания. Дальше буду сам писать в чат, если оно изменится.\n" + schedule_msg
+
+    if not diff:
+        save_data(data)
+        return "Проверил сайт: с прошлого раза расписание не менялось."
+
+    sch["last_change"] = _now_iso()
+    sch["last_diff"] = diff
+    save_data(data)
+    report = f"{SCHEDULE_CHANGE_HEADER}\n{diff}"
+    if notify and watching(bucket):
+        await ping_chat(chat_id, report)
+        await send_plain(chat_id, schedule_msg)
+        return "Нашёл изменения, написал их в чат и отправил актуальное расписание."
+    return report + "\n\n" + schedule_msg
+
+
+async def send_daily_if_needed() -> None:
+    now = school_now()
+    today = now.strftime("%Y-%m-%d")
+    meta = meta_bucket()
+    if now.hour < DAILY_HOUR:
+        return
+    if meta.get("last_daily") == today:
+        return
+    meta["last_daily"] = today
+    save_data(data)
+    for key, bucket in list(data.items()):
+        if key == "_meta" or not isinstance(bucket, dict):
+            continue
+        if not watching(bucket):
+            continue
+        try:
+            chat_id = int(key)
+        except ValueError:
+            continue
+        sch = bucket.get("schedule") or {}
+        snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+        if snap is None:
+            try:
+                await refresh_schedule(chat_id, notify=True)
+            except Exception:
+                log.exception("Вечерняя проверка расписания %s", key)
+            continue
+        try:
+            await send_plain(
+                chat_id,
+                format_schedule_message(
+                    snap, sch.get("class_filter") or "", days_ahead=1
+                ),
+            )
+        except Exception:
+            log.exception("Не отправил вечернее расписание в %s", key)
+
+
+async def check_all_chats() -> None:
+    for key, bucket in list(data.items()):
+        if key == "_meta" or not isinstance(bucket, dict):
+            continue
+        if not watching(bucket):
+            continue
+        url = (bucket.get("schedule") or {}).get("url") or SCHOOL_URL
+        if not url:
+            continue
+        try:
+            chat_id = int(key)
+        except ValueError:
+            continue
+        try:
+            await refresh_schedule(chat_id, notify=True)
+        except Exception:
+            log.exception("Проверка расписания для чата %s упала", key)
+
+
+def _parse_slot_kwargs() -> dict:
+    return {
+        "start_hour": SCHEDULE_PARSE_START_HOUR,
+        "every_hours": SCHEDULE_PARSE_EVERY_HOURS,
+        "end_hour": SCHEDULE_PARSE_END_HOUR,
+    }
+
+
+async def schedule_loop() -> None:
+    while True:
+        try:
+            now = school_now()
+            due = last_due_parse_slot(now, **_parse_slot_kwargs())
+            meta = meta_bucket()
+            slot_id = due.strftime("%Y-%m-%dT%H") if due else ""
+            if slot_id and meta.get("last_parse_slot") != slot_id:
+                log.info("Проверяю сайт школы, слот %s", slot_id)
+                await check_all_chats()
+                await send_daily_if_needed()
+                meta["last_parse_slot"] = slot_id
+                save_data(data)
+            nxt = next_parse_at(school_now(), **_parse_slot_kwargs())
+            delay = max(1.0, (nxt - school_now()).total_seconds() + 1)
+            log.info("Следующая проверка сайта в %s (через %.0f мин)", nxt.isoformat(), delay / 60)
+            await asyncio.sleep(delay)
+        except Exception:
+            log.exception("Цикл проверки расписания")
+            await asyncio.sleep(60)
+
+
 # ── /call [текст] ──
 @dp.message(Command("call"))
 async def cmd_call(message: Message, command: CommandObject):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
     await do_call(message, command.args)
 
 
@@ -165,36 +437,46 @@ _call_re = re.compile(r"^(калл|call|кол|зов)\b\s*(.*)$", re.IGNORECASE
 
 @dp.message(F.text.regexp(_call_re))
 async def text_call(message: Message):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
     m = _call_re.match(message.text.strip())
     custom_text = m.group(2) if m else None
     await do_call(message, custom_text)
 
 
-# ── помощь ──
+HELP_TEXT = (
+    "<b>Зазывалкин</b>\n\n"
+    "• <code>калл</code> — позвать всех\n"
+    "• <code>калл ТЕКСТ</code> — позвать всех и показать этот текст\n"
+    "  (например: <code>калл собираемся на созвон через 5 минут</code>)\n\n"
+    "<b>Расписание СОШ №46</b> — бот сам ходит на сайт и пишет в группу:\n"
+    "• с 8:00 каждые 2 часа (UTC+4) проверяет сайт; если что-то поменялось — зовёт всех и пишет изменения\n"
+    "• в 18:00 (UTC+4) присылает расписание на завтра\n"
+    "• <code>расписание</code> — показать расписание (после 18:00 UTC+4 — на завтра)\n"
+    "• <code>изменения</code> — последний найденный дифф\n"
+    "• <code>/schoolclass 8А</code> — (админ) присылать только этот класс\n"
+    "• <code>/schoolstop</code> — (админ) выключить автосообщения\n"
+    "• <code>/schoolwatch</code> — (админ) снова включить\n\n"
+    "<b>Эмодзи и настройки:</b>\n"
+    "• <code>/emoji 🔥</code> — задать себе эмодзи\n"
+    "• <code>/setemoji @user 🔥</code> — (админ) эмодзи другому\n"
+    "• <code>/join</code> / <code>/leave</code> — вход/выход из списка\n"
+    "• <code>/who</code> — кто в списке\n"
+    "• <code>/calltext ТЕКСТ</code> — (админ) заголовок по умолчанию\n\n"
+    "⚠️ У @BotFather отключи Privacy Mode, иначе я не вижу сообщения в группе.\n"
+    "ℹ️ Я запоминаю людей, когда они пишут в чат — весь список участников "
+    "Telegram боту не выдаёт."
+)
+
+
 @dp.message(Command("start", "help"))
 async def cmd_help(message: Message):
-    remember_user(message.chat.id, message.from_user)
-    await message.reply(
-        "<b>Бот-звалка «Калл»</b>\n\n"
-        "• <code>калл</code> — позвать всех\n"
-        "• <code>калл ТЕКСТ</code> — позвать всех и показать этот текст\n"
-        "  (например: <code>калл собираемся на созвон через 5 минут</code>)\n\n"
-        "<b>Эмодзи и настройки:</b>\n"
-        "• <code>/emoji 🔥</code> — задать себе эмодзи\n"
-        "• <code>/setemoji @user 🔥</code> — (админ) эмодзи другому\n"
-        "• <code>/join</code> / <code>/leave</code> — вход/выход из списка\n"
-        "• <code>/who</code> — кто в списке\n"
-        "• <code>/calltext ТЕКСТ</code> — (админ) заголовок по умолчанию\n\n"
-        "⚠️ У @BotFather отключи Privacy Mode, иначе я не вижу сообщения в группе.\n"
-        "ℹ️ Я запоминаю людей, когда они пишут в чат — весь список участников "
-        "Telegram боту не выдаёт."
-    )
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    await message.reply(HELP_TEXT)
 
 
 @dp.message(Command("join"))
 async def cmd_join(message: Message):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
     emoji = chat_bucket(message.chat.id)["users"][str(message.from_user.id)]["emoji"]
     await message.reply(f"Готово, добавил тебя в список {emoji}")
 
@@ -213,7 +495,7 @@ async def cmd_leave(message: Message):
 
 @dp.message(Command("emoji"))
 async def cmd_emoji(message: Message, command: CommandObject):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
     arg = (command.args or "").strip()
     if not arg:
         await message.reply("Использование: <code>/emoji 🔥</code>")
@@ -226,7 +508,7 @@ async def cmd_emoji(message: Message, command: CommandObject):
 
 @dp.message(Command("setemoji"))
 async def cmd_setemoji(message: Message, command: CommandObject):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
     if not await is_admin(message, message.from_user.id):
         await message.reply("Только для админов.")
         return
@@ -263,7 +545,7 @@ async def cmd_setemoji(message: Message, command: CommandObject):
 
 @dp.message(Command("calltext"))
 async def cmd_calltext(message: Message, command: CommandObject):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
     if not await is_admin(message, message.from_user.id):
         await message.reply("Только для админов.")
         return
@@ -278,7 +560,7 @@ async def cmd_calltext(message: Message, command: CommandObject):
 
 @dp.message(Command("who"))
 async def cmd_who(message: Message):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
     users = chat_bucket(message.chat.id)["users"]
     if not users:
         await message.reply("Пока никого не знаю. Пусть люди напишут /join.")
@@ -287,16 +569,189 @@ async def cmd_who(message: Message):
     await message.reply("Знаю этих людей:\n" + "\n".join(lines))
 
 
+def _http_url(raw: str) -> str | None:
+    url = raw.strip()
+    if not url:
+        return None
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    if not re.match(r"^https?://[^.\s]+\.[^\s]+", url, re.I):
+        return None
+    return url
+
+
+@dp.message(Command("schoolurl"))
+async def cmd_schoolurl(message: Message, command: CommandObject):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    if not await is_admin(message, message.from_user.id):
+        await message.reply("Только для админов.")
+        return
+    url = _http_url(command.args or "")
+    if not url:
+        current = chat_bucket(message.chat.id)["schedule"].get("url") or SCHOOL_URL or "не задан"
+        await message.reply(
+            "Использование: <code>/schoolurl https://ваш-сайт-школы.ru/raspisanie</code>\n"
+            f"Сейчас: {escape(str(current))}"
+        )
+        return
+    sch = chat_bucket(message.chat.id)["schedule"]
+    sch["url"] = url
+    sch["snapshot"] = None
+    sch["last_diff"] = ""
+    save_data(data)
+    await message.reply(
+        f"Сайт школы: {escape(url)}\n"
+        "Дальше сам буду присылать расписание и изменения."
+    )
+
+
+@dp.message(Command("schoolclass"))
+async def cmd_schoolclass(message: Message, command: CommandObject):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    if not await is_admin(message, message.from_user.id):
+        await message.reply("Только для админов.")
+        return
+    value = (command.args or "").strip()
+    sch = chat_bucket(message.chat.id)["schedule"]
+    sch["class_filter"] = value
+    sch["snapshot"] = None
+    save_data(data)
+    if value:
+        await message.reply(f"Буду выделять строки про класс <b>{escape(value)}</b>.")
+    else:
+        await message.reply("Фильтр класса снят — смотрю всё расписание на странице.")
+
+
+@dp.message(Command("schoolwatch"))
+async def cmd_schoolwatch(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    if not await is_admin(message, message.from_user.id):
+        await message.reply("Только для админов.")
+        return
+    sch = chat_bucket(message.chat.id)["schedule"]
+    url = (sch.get("url") or SCHOOL_URL or "").strip()
+    if not url:
+        await message.reply("Сначала задайте сайт: <code>/schoolurl https://…</code>")
+        return
+    sch["watch"] = True
+    sch["stopped"] = False
+    save_data(data)
+    status = await refresh_schedule(message.chat.id, notify=True)
+    await message.reply(
+        f"Снова сам присылаю расписание СОШ №46 в этот чат.\n{status}"
+    )
+
+
+@dp.message(Command("schoolstop"))
+async def cmd_schoolstop(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    if not await is_admin(message, message.from_user.id):
+        await message.reply("Только для админов.")
+        return
+    chat_bucket(message.chat.id)["schedule"]["watch"] = False
+    chat_bucket(message.chat.id)["schedule"]["stopped"] = True
+    save_data(data)
+    await message.reply("Больше сам не присылаю расписание в этот чат.")
+
+
+@dp.message(Command("schoolcheck", "school"))
+async def cmd_schoolcheck(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    if not await is_admin(message, message.from_user.id):
+        await message.reply("Только для админов.")
+        return
+    status = await refresh_schedule(message.chat.id, notify=True)
+    for part in _chunk_text(status):
+        await message.reply(part)
+
+
+@dp.message(Command("расписание", "raspisanie", "schedule"))
+async def cmd_raspisanie(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    bucket = chat_bucket(message.chat.id)
+    sch = bucket["schedule"]
+    snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+    url = (sch.get("url") or SCHOOL_URL or "").strip()
+    if snap is None:
+        if not url:
+            await message.reply(
+                "Сайт школы не задан. Админ: <code>/schoolurl https://сайт-школы.ru</code>"
+            )
+            return
+        status = await refresh_schedule(message.chat.id, notify=False)
+        for part in _chunk_text(status):
+            await message.reply(part)
+        return
+    when = sch.get("last_check") or "неизвестно"
+    text = format_schedule_message(
+        snap, sch.get("class_filter") or "", days_ahead=evening_days_ahead()
+    )
+    text = f"Проверено: {when}\n\n" + text
+    for part in _chunk_text(text):
+        await message.reply(part)
+
+
+@dp.message(Command("изменения", "izmeneniya", "changes"))
+async def cmd_izmeneniya(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    sch = chat_bucket(message.chat.id)["schedule"]
+    diff = sch.get("last_diff") or ""
+    if not diff:
+        await message.reply("Пока не видел изменений. Напишите /расписание или /schoolcheck.")
+        return
+    when = sch.get("last_change") or ""
+    text = f"{SCHEDULE_CHANGE_HEADER}\n{diff}"
+    if when:
+        text += f"\n\nЗафиксировано: {when}"
+    for part in _chunk_text(text):
+        await message.reply(part)
+
+
+_rasp_re = re.compile(r"^/?(расписание|изменения)(?:@\w+)?\s*$", re.IGNORECASE)
+
+@dp.message(F.text.regexp(_rasp_re))
+async def text_schedule(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    word = message.text.strip().lower()
+    if word == "изменения":
+        await cmd_izmeneniya(message)
+    else:
+        await cmd_raspisanie(message)
+
+
 # ловим любой текст, чтобы запоминать людей (идёт последним)
 @dp.message(F.text)
 async def remember_on_any_text(message: Message):
-    remember_user(message.chat.id, message.from_user)
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+
+
+@dp.my_chat_member()
+async def bot_membership(event: ChatMemberUpdated):
+    new_status = event.new_chat_member.status
+    if new_status not in {"member", "administrator"}:
+        return
+    bucket = chat_bucket(event.chat.id)
+    bucket["chat_type"] = event.chat.type
+    sch = bucket["schedule"]
+    sch["url"] = sch.get("url") or SCHOOL_URL
+    sch["stopped"] = False
+    sch["watch"] = True
+    save_data(data)
+    try:
+        await bot.send_message(
+            event.chat.id,
+            "Я Зазывалкин. Сам присылаю расписание СОШ №46 и пишу, когда оно меняется.",
+        )
+        await refresh_schedule(event.chat.id, notify=True)
+    except Exception:
+        log.exception("Не смог отправить расписание после добавления в чат")
 
 
 async def main():
     if not TOKEN:
         raise SystemExit("Укажи токен бота в переменной окружения BOT_TOKEN.")
     print("Бот запущен. Ctrl+C для остановки.")
+    asyncio.create_task(schedule_loop())
     await dp.start_polling(bot)
 
 
