@@ -69,6 +69,9 @@ CSV_SAMPLE = """ПОНЕДЕЛЬНИК,,,,,,,,
 ЧЕТВЕРГ,,,,,,,,
 ,,5А,5Б,8А
 09.00-9.40,1,Физкультура,Русский,Алгебра
+ПЯТНИЦА,,,,,,,,
+,,5А,5Б,8А
+09.00-9.40,1,Русский,Математика,Геометрия
 """
 
 
@@ -114,9 +117,12 @@ class ScheduleParseTests(unittest.TestCase):
         lessons = parse_timetable_csv(CSV_SAMPLE, sheet="5-11 классы")
         text = "\n".join(les.line() for les in lessons)
         evening = datetime(2026, 8, 27, 18, 0, tzinfo=timezone(timedelta(hours=4)))
-        msg = format_day_schedule(text, class_filter="8А", now=evening, days_ahead=1)
+        msg = format_day_schedule(
+            text, class_filter="8А", now=evening, days_ahead=1, week=False
+        )
         self.assertIn("пятниц", msg.lower())
         self.assertIn("28.08.2026", msg)
+        self.assertIn("Геометрия", msg)
 
     def test_diff_describes_lesson_change(self):
         t1, _, f1, _ = build_snapshot_text("https://school.test/r", SCHEDULE_V1)
@@ -136,10 +142,35 @@ class ScheduleParseTests(unittest.TestCase):
         snap.fingerprint = fingerprint_of(snap)
         self.assertIsNone(describe_changes(snap, snap))
 
-    def test_class_filter_keeps_class_rows(self):
-        text, _, _, _ = build_snapshot_text("https://school.test/r", SCHEDULE_V1)
-        filtered = filter_lines_for_class(text, "8А")
-        self.assertTrue(any("8А" in line or "8а" in line.lower() for line in filtered.splitlines()))
+    def test_class_filter_exact_10a_not_times(self):
+        text = "\n".join([
+            "5-11 классы | ЧЕТВЕРГ | 10А | 2. 8.50–9.30 Химия 314",
+            "5-11 классы | ЧЕТВЕРГ | 1а | 2. 09.50-10.30 Русский язык",
+            "1-4 классы | ЧЕТВЕРГ | 4д | 8. 14.30-15.10 Английский язык",
+            "5-11 классы | ЧЕТВЕРГ | 7А | 7. 13.30-14.10 Алгебра",
+        ])
+        filtered = filter_lines_for_class(text, "10А")
+        self.assertIn("10А", filtered)
+        self.assertNotIn("1а", filtered)
+        self.assertNotIn("4д", filtered)
+        self.assertNotIn("7А", filtered)
+        thursday = datetime(2026, 8, 27, 12, 0, tzinfo=timezone(timedelta(hours=4)))
+        msg = format_day_schedule(text, class_filter="10a", now=thursday)
+        self.assertIn("Химия", msg)
+        self.assertNotIn("Русский язык", msg)
+        self.assertNotIn("Английский язык", msg)
+
+    def test_week_is_standard_and_skips_empty_changes(self):
+        lessons = parse_timetable_csv(CSV_SAMPLE, sheet="5-11 классы")
+        text = "\n".join(les.line() for les in lessons)
+        thursday = datetime(2026, 8, 27, 12, 0, tzinfo=timezone(timedelta(hours=4)))
+        msg = format_day_schedule(text, class_filter="8А", now=thursday)
+        self.assertIn("ПОНЕДЕЛЬНИК", msg)
+        self.assertIn("ЧЕТВЕРГ", msg)
+        self.assertIn("Основное расписание", msg)
+        self.assertIn("Замен на сайте сейчас нет", msg)
+        self.assertIn("История", msg)
+        self.assertIn("Алгебра", msg)
 
     def test_file_hash_change(self):
         old = ScheduleSnapshot(
