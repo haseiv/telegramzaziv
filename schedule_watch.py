@@ -659,3 +659,26 @@ async def collect_schedule(
     finally:
         if own_session:
             await session.close()
+
+
+async def preview(class_filter: str = "") -> None:
+    """Скачать сайт и показать, что бот отправил бы в чат. Для проверки без Telegram."""
+    snap = await collect_schedule(DEFAULT_SCHOOL_URL, class_filter=class_filter)
+    print("Страницы:")
+    for page in snap.pages:
+        print(" ", page)
+    print("Снимок:", snap.fingerprint[:16], "символов:", len(snap.text))
+    print()
+    print("===== сегодня =====")
+    print(format_day_schedule(snap.text, class_filter=class_filter, days_ahead=0))
+    print()
+    print("===== завтра =====")
+    print(format_day_schedule(snap.text, class_filter=class_filter, days_ahead=1))
+
+
+if __name__ == "__main__":
+    import asyncio
+    import sys
+
+    filt = " ".join(sys.argv[1:]).strip()
+    asyncio.run(preview(filt))
