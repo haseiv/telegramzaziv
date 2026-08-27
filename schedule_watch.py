@@ -90,6 +90,7 @@ class ScheduleSnapshot:
     text: str = ""
     files: list[ScheduleFile] = field(default_factory=list)
     fingerprint: str = ""
+    bells: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +101,7 @@ class ScheduleSnapshot:
                 {"url": f.url, "title": f.title, "sha256": f.sha256} for f in self.files
             ],
             "fingerprint": self.fingerprint,
+            "bells": self.bells,
         }
 
     @classmethod
@@ -121,6 +123,7 @@ class ScheduleSnapshot:
             text=raw.get("text") or "",
             files=files,
             fingerprint=raw.get("fingerprint") or "",
+            bells=raw.get("bells") or "",
         )
         if not snap.fingerprint:
             snap.fingerprint = fingerprint_of(snap)
@@ -355,6 +358,18 @@ def class_matches(actual: str, needle: str) -> bool:
     return normalize_class_name(actual) == normalize_class_name(needle)
 
 
+def split_class_filters(raw: str) -> list[str]:
+    if not _norm_space(raw):
+        return [""]
+    parts = re.split(r"[,;/]| и ", raw, flags=re.I)
+    out: list[str] = []
+    for part in parts:
+        part = re.sub(r"^класс\s+", "", _norm_space(part), flags=re.I)
+        if part:
+            out.append(part)
+    return out or [""]
+
+
 def is_changes_sheet(sheet: str) -> bool:
     low = sheet.lower()
     return "изменен" in low or "замен" in low
@@ -489,6 +504,14 @@ def school_now(now: datetime | None = None) -> datetime:
     return now.astimezone(SCHOOL_TZ)
 
 
+def next_clock_at(hour: int, minute: int = 0, now: datetime | None = None) -> datetime:
+    now = school_now(now)
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
 def parse_hours(start_hour: int = 8, every_hours: int = 2, end_hour: int = 22) -> tuple[int, ...]:
     if every_hours < 1:
         every_hours = 1
@@ -536,6 +559,54 @@ def weekday_ru(now: datetime | None = None) -> str:
 
 
 def sheet_title_from_page(page_url: str, fallback: str = "Расписание") -> str:
+    path = urlparse(page_url).path.lower()
+    if "1-4" in path:
+        return "1-4 классы"
+    if "5-8" in path or "5-11" in path:
+        return "5-11 классы"
+    if "zvonk" in path:
+        return "Звонки"
+    if "raspisanie" in path:
+        return "Изменения"
+    return fallback
+
+
+def extract_bells(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    raw_lines = [_norm_space(unescape(line)) for line in soup.get_text("\n").splitlines()]
+    kept: list[str] = []
+    started = False
+    for line in raw_lines:
+        if not line:
+            continue
+        low = line.lower()
+        if "понедельник" in low and not started:
+            started = True
+        if not started:
+            continue
+        if kept and low in {"расписание", "изменения в расписании", "листать вверх"}:
+            break
+        if kept and line.startswith("©"):
+            break
+        if re.search(r"урок", line, re.I) or "понедельник" in low or "вторник" in low or "суббот" in low:
+            kept.append(line.replace("&#8212;", "—").replace("—", "—"))
+        if len(kept) >= 30:
+            break
+    return "\n".join(kept)
+
+
+def format_bells(bells: str, now: datetime | None = None) -> str:
+    header = "🔔 Расписание звонков СОШ №46"
+    if not bells.strip():
+        return (
+            f"{header}\nНа сайте сетка звонков сейчас не разобралась.\n"
+            "https://sosh46.ru/raspisanie-zvonkov/"
+        )
+    weekday = school_now(now).weekday()
+    label = "сегодня понедельник" if weekday == 0 else "сегодня вторник–суббота"
+    if weekday == 6:
+        label = "сегодня воскресенье"
+    return f"{header} ({label})\n\n{bells}\n\nhttps://sosh46.ru/raspisanie-zvonkov/"
     path = urlparse(page_url).path.lower()
     if "1-4" in path:
         return "1-4 классы"
@@ -695,6 +766,10 @@ async def collect_schedule(
                 texts.append(f"Файл расписания: {final_url}\nsha256: {digest}")
                 return
             html = decode_bytes(raw)
+            if "zvonk" in final_url.lower() or "звонк" in html[:2000].lower():
+                bells = extract_bells(html)
+                if bells:
+                    snap.bells = bells
             text, page_links, file_links, iframes = build_snapshot_text(final_url, html, class_filter)
             texts.append(text)
             file_queue.extend(file_links)
