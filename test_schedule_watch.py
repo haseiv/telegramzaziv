@@ -6,14 +6,18 @@ from schedule_watch import (
     ScheduleSnapshot,
     build_snapshot_text,
     describe_changes,
+    extract_bells,
     filter_lines_for_class,
     fingerprint_of,
+    format_bells,
     format_day_schedule,
     google_sheets_csv_url,
     last_due_parse_slot,
+    next_clock_at,
     next_parse_at,
     parse_timetable_csv,
     parse_hours,
+    split_class_filters,
 )
 
 HOME_HTML = """
@@ -216,6 +220,36 @@ class ScheduleParseTests(unittest.TestCase):
         nxt = next_parse_at(late)
         self.assertEqual(nxt.day, 28)
         self.assertEqual(nxt.hour, 8)
+
+
+    def test_split_classes(self):
+        self.assertEqual(split_class_filters("10А, 10Б"), ["10А", "10Б"])
+        self.assertEqual(split_class_filters("класс 8А и 8В"), ["8А", "8В"])
+
+    def test_extract_bells(self):
+        html = """
+        <html><body>
+        <h1>Расписание звонков</h1>
+        <p>Понедельник</p>
+        <p>1 урок — 9.00 – 9.40</p>
+        <p>2 урок — 9.50 – 10.30</p>
+        <p>Вторник-суббота</p>
+        <p>1 урок — 8.00 – 8.40</p>
+        <p>Расписание</p>
+        </body></html>
+        """
+        bells = extract_bells(html)
+        self.assertIn("Понедельник", bells)
+        self.assertIn("9.00", bells)
+        self.assertIn("Вторник-суббота", bells)
+
+    def test_next_clock_rolls_tomorrow(self):
+        tz = timezone(timedelta(hours=4))
+        now = datetime(2026, 8, 27, 8, 0, tzinfo=tz)
+        nxt = next_clock_at(7, 30, now)
+        self.assertEqual(nxt.day, 28)
+        self.assertEqual(nxt.hour, 7)
+        self.assertEqual(nxt.minute, 30)
 
 
 if __name__ == "__main__":

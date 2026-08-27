@@ -50,17 +50,20 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatType
-from aiogram.types import ChatMemberUpdated, Message
+from aiogram.types import ChatMemberUpdated, KeyboardButton, Message, ReplyKeyboardMarkup
 
 from schedule_watch import (
     DEFAULT_SCHOOL_URL,
     ScheduleSnapshot,
     collect_schedule,
     describe_changes,
+    format_bells,
     format_day_schedule,
     last_due_parse_slot,
+    next_clock_at,
     next_parse_at,
     school_now,
+    split_class_filters,
 )
 
 # ─────────────────────────── настройки ───────────────────────────
@@ -73,6 +76,8 @@ SCHEDULE_PARSE_START_HOUR = int(os.getenv("SCHEDULE_PARSE_START_HOUR", "8"))
 SCHEDULE_PARSE_EVERY_HOURS = max(1, int(os.getenv("SCHEDULE_PARSE_EVERY_HOURS", "2")))
 SCHEDULE_PARSE_END_HOUR = int(os.getenv("SCHEDULE_PARSE_END_HOUR", "22"))
 DAILY_HOUR = int(os.getenv("SCHEDULE_DAILY_HOUR", "18"))
+MORNING_HOUR = int(os.getenv("SCHEDULE_MORNING_HOUR", "7"))
+MORNING_MINUTE = int(os.getenv("SCHEDULE_MORNING_MINUTE", "30"))
 
 # Куда писать данные. Многие хостинги дают персистентную папку через DATA_DIR
 # (переживает передеплой). Если её нет — пишем рядом со скриптом.
@@ -92,8 +97,24 @@ DEFAULT_EMOJI_POOL = [
     "🍀", "💎", "🌸", "🎸", "👾", "🥷", "🧊", "🌊", "🍕", "🦁",
 ]
 
-DEFAULT_CALL_TEXT = "📣 Общий сбор! Все сюда:"
-SCHEDULE_CHANGE_HEADER = "📢 Изменения в расписании школы:"
+BTN_TODAY = "Сегодня"
+BTN_TOMORROW = "Завтра"
+BTN_WEEK = "Неделя"
+BTN_SUBS = "Замены"
+BTN_BELLS = "Звонки"
+
+
+def schedule_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW)],
+            [KeyboardButton(text=BTN_WEEK), KeyboardButton(text=BTN_SUBS)],
+            [KeyboardButton(text=BTN_BELLS), KeyboardButton(text="калл")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="класс 10А  ·  Сегодня  ·  калл",
+    )
 
 # сколько упоминаний в одном сообщении (Telegram не любит очень длинные)
 MENTIONS_PER_MESSAGE = 30
@@ -148,6 +169,7 @@ def meta_bucket() -> dict:
     bucket = data.setdefault("_meta", {})
     bucket.setdefault("last_daily", "")
     bucket.setdefault("last_parse_slot", "")
+    bucket.setdefault("last_morning", "")
     return bucket
 
 
@@ -281,12 +303,17 @@ def format_schedule_message(
     days_ahead: int = 0,
     week: bool | None = None,
 ) -> str:
-    return format_day_schedule(
-        snap.text,
-        class_filter=class_filter,
-        days_ahead=days_ahead,
-        week=week,
-    )
+    parts = []
+    for klass in split_class_filters(class_filter):
+        parts.append(
+            format_day_schedule(
+                snap.text,
+                class_filter=klass,
+                days_ahead=days_ahead,
+                week=week,
+            )
+        )
+    return "\n\n".join(parts)
 
 
 def evening_days_ahead(now=None) -> int:
@@ -294,9 +321,13 @@ def evening_days_ahead(now=None) -> int:
     return 1 if school_now(now).hour >= DAILY_HOUR else 0
 
 
-async def send_plain(chat_id: int, text: str) -> None:
-    for part in _chunk_text(text):
-        await bot.send_message(chat_id, part)
+async def send_plain(chat_id: int, text: str, reply_markup=None) -> None:
+    parts = _chunk_text(text)
+    for i, part in enumerate(parts):
+        kwargs = {}
+        if reply_markup is not None and i == len(parts) - 1:
+            kwargs["reply_markup"] = reply_markup
+        await bot.send_message(chat_id, part, **kwargs)
 
 
 async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
@@ -330,9 +361,17 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
     if old is None:
         save_data(data)
         if notify and watching(bucket):
-            await send_plain(chat_id, schedule_msg)
-            return "Снял расписание с сайта школы и отправил в чат. Дальше сам буду писать, если что-то изменится."
-        return "Снял первый снимок расписания. Дальше буду сам писать в чат, если оно изменится.\n" + schedule_msg
+            klass = sch.get("class_filter") or ""
+            if klass:
+                await send_plain(chat_id, schedule_msg, reply_markup=schedule_keyboard())
+            else:
+                await send_plain(
+                    chat_id,
+                    "Слежу за сайтом СОШ №46. Напишите <code>класс 10А</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя.",
+                    reply_markup=schedule_keyboard(),
+                )
+            return "Запомнил расписание. Дальше напишу сам, если появятся замены."
+        return "Снял первый снимок обычного расписания. Замены пришлю, когда их выложат.\n" + schedule_msg
 
     if not diff:
         save_data(data)
@@ -344,8 +383,11 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
     report = f"{SCHEDULE_CHANGE_HEADER}\n{diff}"
     if notify and watching(bucket):
         await ping_chat(chat_id, report)
-        await send_plain(chat_id, schedule_msg)
-        return "Нашёл изменения, написал их в чат и отправил актуальное расписание."
+        today = format_schedule_message(
+            snap, sch.get("class_filter") or "", days_ahead=0, week=False
+        )
+        await send_plain(chat_id, today, reply_markup=schedule_keyboard())
+        return "Нашёл изменения на сайте и написал в чат."
     return report + "\n\n" + schedule_msg
 
 
@@ -382,9 +424,47 @@ async def send_daily_if_needed() -> None:
                 format_schedule_message(
                     snap, sch.get("class_filter") or "", days_ahead=1, week=False
                 ),
+                reply_markup=schedule_keyboard(),
             )
         except Exception:
             log.exception("Не отправил вечернее расписание в %s", key)
+
+
+async def send_morning_if_needed() -> None:
+    now = school_now()
+    today = now.strftime("%Y-%m-%d")
+    meta = meta_bucket()
+    morning = now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
+    if now < morning:
+        return
+    if meta.get("last_morning") == today:
+        return
+    meta["last_morning"] = today
+    save_data(data)
+    for key, bucket in list(data.items()):
+        if key == "_meta" or not isinstance(bucket, dict):
+            continue
+        if not watching(bucket):
+            continue
+        try:
+            chat_id = int(key)
+        except ValueError:
+            continue
+        sch = bucket.get("schedule") or {}
+        snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+        if snap is None:
+            continue
+        try:
+            await send_plain(
+                chat_id,
+                "☀️ Доброе утро. Расписание на сегодня:\n\n"
+                + format_schedule_message(
+                    snap, sch.get("class_filter") or "", days_ahead=0, week=False
+                ),
+                reply_markup=schedule_keyboard(),
+            )
+        except Exception:
+            log.exception("Не отправил утреннее расписание в %s", key)
 
 
 async def check_all_chats() -> None:
@@ -424,12 +504,17 @@ async def schedule_loop() -> None:
             if slot_id and meta.get("last_parse_slot") != slot_id:
                 log.info("Проверяю сайт школы, слот %s", slot_id)
                 await check_all_chats()
-                await send_daily_if_needed()
                 meta["last_parse_slot"] = slot_id
                 save_data(data)
-            nxt = next_parse_at(school_now(), **_parse_slot_kwargs())
+            await send_morning_if_needed()
+            await send_daily_if_needed()
+            nxt = min(
+                next_parse_at(school_now(), **_parse_slot_kwargs()),
+                next_clock_at(MORNING_HOUR, MORNING_MINUTE),
+                next_clock_at(DAILY_HOUR, 0),
+            )
             delay = max(1.0, (nxt - school_now()).total_seconds() + 1)
-            log.info("Следующая проверка сайта в %s (через %.0f мин)", nxt.isoformat(), delay / 60)
+            log.info("Следующая задача в %s (через %.0f мин)", nxt.isoformat(), delay / 60)
             await asyncio.sleep(delay)
         except Exception:
             log.exception("Цикл проверки расписания")
@@ -457,33 +542,23 @@ async def text_call(message: Message):
 HELP_TEXT = (
     "<b>Зазывалкин</b>\n\n"
     "• <code>калл</code> — позвать всех\n"
-    "• <code>калл ТЕКСТ</code> — позвать всех и показать этот текст\n"
-    "  (например: <code>калл собираемся на созвон через 5 минут</code>)\n\n"
-    "<b>Расписание СОШ №46</b> — бот сам ходит на сайт и пишет в группу:\n"
-    "• с 8:00 каждые 2 часа (UTC+4) проверяет сайт; если что-то поменялось — зовёт всех и пишет изменения\n"
-    "• в 18:00 (UTC+4) присылает расписание на завтра из обычной сетки (замены — только если их выложили)\n"
-    "• <code>класс 10А</code> — обычное расписание этого класса на неделю\n"
-    "• <code>расписание</code> — показать расписание (после 18:00 UTC+4 — на завтра)\n"
-    "• <code>изменения</code> — последний найденный дифф\n"
-    "• <code>/schoolclass 8А</code> — (админ) присылать только этот класс\n"
-    "• <code>/schoolstop</code> — (админ) выключить автосообщения\n"
-    "• <code>/schoolwatch</code> — (админ) снова включить\n\n"
-    "<b>Эмодзи и настройки:</b>\n"
-    "• <code>/emoji 🔥</code> — задать себе эмодзи\n"
-    "• <code>/setemoji @user 🔥</code> — (админ) эмодзи другому\n"
-    "• <code>/join</code> / <code>/leave</code> — вход/выход из списка\n"
-    "• <code>/who</code> — кто в списке\n"
-    "• <code>/calltext ТЕКСТ</code> — (админ) заголовок по умолчанию\n\n"
-    "⚠️ У @BotFather отключи Privacy Mode, иначе я не вижу сообщения в группе.\n"
-    "ℹ️ Я запоминаю людей, когда они пишут в чат — весь список участников "
-    "Telegram боту не выдаёт."
+    "• кнопки внизу: Сегодня, Завтра, Неделя, Замены, Звонки\n"
+    "• <code>класс 10А</code> — обычная сетка этого класса (можно <code>10А, 10Б</code>)\n"
+    "• утром в 7:30 (UTC+4) — расписание на сегодня\n"
+    "• в 18:00 (UTC+4) — расписание на завтра\n"
+    "• каждые 2 часа с 8:00 проверяет сайт и зовёт всех, только если появились замены\n\n"
+    "<b>Ещё:</b>\n"
+    "• <code>/emoji 🔥</code> — свой эмодзи\n"
+    "• <code>/join</code> / <code>/leave</code> / <code>/who</code>\n"
+    "• <code>/schoolstop</code> — выключить автосообщения\n\n"
+    "⚠️ У @BotFather отключи Privacy Mode, иначе я не вижу сообщения в группе."
 )
 
 
 @dp.message(Command("start", "help"))
 async def cmd_help(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    await message.reply(HELP_TEXT)
+    await message.reply(HELP_TEXT, reply_markup=schedule_keyboard())
 
 
 @dp.message(Command("join"))
@@ -646,7 +721,7 @@ async def apply_class_filter(message: Message, value: str) -> None:
         "Замены пришлю отдельно, когда их выложат."
     )
     for part in _chunk_text(format_schedule_message(snap, value, days_ahead=0)):
-        await message.reply(part)
+        await message.reply(part, reply_markup=schedule_keyboard())
 
 
 @dp.message(Command("schoolclass", "class", "класс"))
@@ -698,50 +773,89 @@ async def cmd_schoolcheck(message: Message):
         await message.reply(part)
 
 
-@dp.message(Command("расписание", "raspisanie", "schedule"))
+async def ensure_snapshot(chat_id: int):
+    sch = chat_bucket(chat_id)["schedule"]
+    snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+    if snap is None:
+        await refresh_schedule(chat_id, notify=False)
+        sch = chat_bucket(chat_id)["schedule"]
+        snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+    return snap, sch.get("class_filter") or ""
+
+
+async def reply_schedule_view(message: Message, *, days_ahead: int = 0, week: bool = False) -> None:
+    snap, klass = await ensure_snapshot(message.chat.id)
+    if not snap:
+        await message.reply("Пока нет снимка с сайта. Напишите <code>класс 10А</code>.")
+        return
+    text = format_schedule_message(snap, klass, days_ahead=days_ahead, week=week)
+    for part in _chunk_text(text):
+        await message.reply(part, reply_markup=schedule_keyboard())
+
+
+@dp.message(Command("расписание", "raspisanie", "schedule", "today", "сегодня"))
 async def cmd_raspisanie(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    bucket = chat_bucket(message.chat.id)
-    sch = bucket["schedule"]
-    snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
-    url = (sch.get("url") or SCHOOL_URL or "").strip()
-    if snap is None:
-        if not url:
-            await message.reply(
-                "Сайт школы не задан. Админ: <code>/schoolurl https://сайт-школы.ru</code>"
-            )
-            return
-        status = await refresh_schedule(message.chat.id, notify=False)
-        for part in _chunk_text(status):
-            await message.reply(part)
-        return
-    when = sch.get("last_check") or "неизвестно"
-    text = format_schedule_message(
-        snap, sch.get("class_filter") or "", days_ahead=evening_days_ahead()
-    )
-    text = f"Проверено: {when}\n\n" + text
-    for part in _chunk_text(text):
-        await message.reply(part)
+    await reply_schedule_view(message, days_ahead=0, week=False)
 
 
-@dp.message(Command("изменения", "izmeneniya", "changes"))
+@dp.message(Command("tomorrow", "завтра"))
+async def cmd_tomorrow(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    await reply_schedule_view(message, days_ahead=1, week=False)
+
+
+@dp.message(Command("week", "неделя"))
+async def cmd_week(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    await reply_schedule_view(message, days_ahead=0, week=True)
+
+
+@dp.message(Command("bells", "звонки", "zvonki"))
+async def cmd_bells(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    snap, _klass = await ensure_snapshot(message.chat.id)
+    bells = snap.bells if snap else ""
+    await message.reply(format_bells(bells), reply_markup=schedule_keyboard())
+
+
+@dp.message(Command("изменения", "izmeneniya", "changes", "замены"))
 async def cmd_izmeneniya(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
     sch = chat_bucket(message.chat.id)["schedule"]
     diff = sch.get("last_diff") or ""
     if not diff:
-        await message.reply("Пока не видел изменений. Напишите /расписание или /schoolcheck.")
+        await message.reply(
+            "Замен на сайте сейчас нет — действует обычное расписание.",
+            reply_markup=schedule_keyboard(),
+        )
         return
     when = sch.get("last_change") or ""
     text = f"{SCHEDULE_CHANGE_HEADER}\n{diff}"
     if when:
         text += f"\n\nЗафиксировано: {when}"
     for part in _chunk_text(text):
-        await message.reply(part)
+        await message.reply(part, reply_markup=schedule_keyboard())
 
 
+_btn_re = re.compile(r"^(сегодня|завтра|неделя|замены|звонки)$", re.IGNORECASE)
 _rasp_re = re.compile(r"^/?(расписание|изменения)(?:@\w+)?(?:\s+(\S.*))?$", re.IGNORECASE)
 _class_re = re.compile(r"^/?(класс|class)(?:@\w+)?\s+(\S.*)$", re.IGNORECASE)
+
+@dp.message(F.text.regexp(_btn_re))
+async def text_buttons(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    key = message.text.strip().lower()
+    if key == "сегодня":
+        await reply_schedule_view(message, days_ahead=0, week=False)
+    elif key == "завтра":
+        await reply_schedule_view(message, days_ahead=1, week=False)
+    elif key == "неделя":
+        await reply_schedule_view(message, days_ahead=0, week=True)
+    elif key == "замены":
+        await cmd_izmeneniya(message)
+    else:
+        await cmd_bells(message)
 
 @dp.message(F.text.regexp(_class_re))
 async def text_class(message: Message):
@@ -787,9 +901,10 @@ async def bot_membership(event: ChatMemberUpdated):
     try:
         await bot.send_message(
             event.chat.id,
-            "Я Зазывалкин. Сам присылаю расписание СОШ №46 и пишу, когда оно меняется.",
+            "Я Зазывалкин. Напишите <code>класс 10А</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя, Замены, Звонки.",
+            reply_markup=schedule_keyboard(),
         )
-        await refresh_schedule(event.chat.id, notify=True)
+        await refresh_schedule(event.chat.id, notify=False)
     except Exception:
         log.exception("Не смог отправить расписание после добавления в чат")
 
