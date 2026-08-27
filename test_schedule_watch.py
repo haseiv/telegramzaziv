@@ -1,6 +1,5 @@
 import unittest
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
 
 from schedule_watch import (
     ScheduleFile,
@@ -102,11 +101,19 @@ class ScheduleParseTests(unittest.TestCase):
     def test_format_thursday_for_class(self):
         lessons = parse_timetable_csv(CSV_SAMPLE, sheet="5-11 классы")
         text = "\n".join(les.line() for les in lessons)
-        thursday = datetime(2026, 8, 27, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+        thursday = datetime(2026, 8, 27, 12, 0, tzinfo=timezone(timedelta(hours=4)))
         msg = format_day_schedule(text, class_filter="8А", now=thursday)
         self.assertIn("8А", msg)
         self.assertIn("Алгебра", msg)
         self.assertNotIn("Физкультура", msg)
+
+    def test_evening_post_is_tomorrow(self):
+        lessons = parse_timetable_csv(CSV_SAMPLE, sheet="5-11 классы")
+        text = "\n".join(les.line() for les in lessons)
+        evening = datetime(2026, 8, 27, 18, 0, tzinfo=timezone(timedelta(hours=4)))
+        msg = format_day_schedule(text, class_filter="8А", now=evening, days_ahead=1)
+        self.assertIn("пятниц", msg.lower())
+        self.assertIn("28.08.2026", msg)
 
     def test_diff_describes_lesson_change(self):
         t1, _, f1, _ = build_snapshot_text("https://school.test/r", SCHEDULE_V1)

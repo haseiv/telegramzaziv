@@ -7,11 +7,10 @@ import hashlib
 import io
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from typing import Iterable
 from urllib.parse import parse_qs, urljoin, urlparse
-from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, Tag
 
@@ -22,7 +21,7 @@ SOSH46_PAGES = (
     "https://sosh46.ru/raspisanie-5-8-klass/",
     "https://sosh46.ru/raspisanie-zvonkov/",
 )
-MOSCOW = ZoneInfo("Europe/Moscow")
+SCHOOL_TZ = timezone(timedelta(hours=4))  # UTC+4
 
 SCHEDULE_KEYWORDS = (
     "расписан",
@@ -333,16 +332,16 @@ def filter_lines_for_class(text: str, class_name: str) -> str:
     return "\n".join(kept) if kept else text
 
 
-def moscow_now(now: datetime | None = None) -> datetime:
+def school_now(now: datetime | None = None) -> datetime:
     if now is None:
-        return datetime.now(MOSCOW)
+        return datetime.now(SCHOOL_TZ)
     if now.tzinfo is None:
-        return now.replace(tzinfo=MOSCOW)
-    return now.astimezone(MOSCOW)
+        return now.replace(tzinfo=SCHOOL_TZ)
+    return now.astimezone(SCHOOL_TZ)
 
 
 def weekday_ru(now: datetime | None = None) -> str:
-    return DAY_NAMES[moscow_now(now).weekday()].upper()
+    return DAY_NAMES[school_now(now).weekday()].upper()
 
 
 def format_day_schedule(
@@ -350,10 +349,12 @@ def format_day_schedule(
     *,
     class_filter: str = "",
     now: datetime | None = None,
+    days_ahead: int = 0,
     limit: int = 3500,
 ) -> str:
-    day = weekday_ru(now)
-    date = moscow_now(now).strftime("%d.%m.%Y")
+    when = school_now(now) + timedelta(days=days_ahead)
+    day = DAY_NAMES[when.weekday()].upper()
+    date = when.strftime("%d.%m.%Y")
     lines = text.splitlines()
     if class_filter:
         lines = filter_lines_for_class("\n".join(lines), class_filter).splitlines()

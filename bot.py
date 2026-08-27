@@ -58,7 +58,7 @@ from schedule_watch import (
     collect_schedule,
     describe_changes,
     format_day_schedule,
-    moscow_now,
+    school_now,
 )
 
 # ─────────────────────────── настройки ───────────────────────────
@@ -68,7 +68,7 @@ SCHOOL_URL = (os.getenv("SCHOOL_URL", "") or DEFAULT_SCHOOL_URL).strip()
 SCHOOL_CLASS = os.getenv("SCHOOL_CLASS", "").strip()
 SCHOOL_INSECURE_SSL = os.getenv("SCHOOL_INSECURE_SSL", "").strip() in {"1", "true", "yes"}
 SCHEDULE_POLL_SECONDS = max(60, int(os.getenv("SCHEDULE_POLL_SECONDS", "600")))
-DAILY_HOUR = int(os.getenv("SCHEDULE_DAILY_HOUR", "7"))
+DAILY_HOUR = int(os.getenv("SCHEDULE_DAILY_HOUR", "18"))
 
 # Куда писать данные. Многие хостинги дают персистентную папку через DATA_DIR
 # (переживает передеплой). Если её нет — пишем рядом со скриптом.
@@ -269,8 +269,13 @@ async def ping_chat(chat_id: int, header: str) -> None:
             await bot.send_message(chat_id, " ".join(chunk))
 
 
-def format_schedule_message(snap: ScheduleSnapshot, class_filter: str = "") -> str:
-    return format_day_schedule(snap.text, class_filter=class_filter)
+def format_schedule_message(snap: ScheduleSnapshot, class_filter: str = "", *, days_ahead: int = 0) -> str:
+    return format_day_schedule(snap.text, class_filter=class_filter, days_ahead=days_ahead)
+
+
+def evening_days_ahead(now=None) -> int:
+    """После 18:00 UTC+4 шлём уже завтрашнее расписание — его выкладывают вечером."""
+    return 1 if school_now(now).hour >= DAILY_HOUR else 0
 
 
 async def send_plain(chat_id: int, text: str) -> None:
@@ -302,7 +307,9 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
     sch["last_check"] = _now_iso()
     sch["last_error"] = ""
     sch["snapshot"] = snap.to_dict()
-    schedule_msg = format_schedule_message(snap, sch.get("class_filter") or "")
+    schedule_msg = format_schedule_message(
+        snap, sch.get("class_filter") or "", days_ahead=evening_days_ahead()
+    )
 
     if old is None:
         save_data(data)
@@ -327,7 +334,7 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
 
 
 async def send_daily_if_needed() -> None:
-    now = moscow_now()
+    now = school_now()
     today = now.strftime("%Y-%m-%d")
     meta = meta_bucket()
     if now.hour < DAILY_HOUR:
@@ -351,15 +358,17 @@ async def send_daily_if_needed() -> None:
             try:
                 await refresh_schedule(chat_id, notify=True)
             except Exception:
-                log.exception("Утренняя проверка расписания %s", key)
+                log.exception("Вечерняя проверка расписания %s", key)
             continue
         try:
             await send_plain(
                 chat_id,
-                format_schedule_message(snap, sch.get("class_filter") or ""),
+                format_schedule_message(
+                    snap, sch.get("class_filter") or "", days_ahead=1
+                ),
             )
         except Exception:
-            log.exception("Не отправил утреннее расписание в %s", key)
+            log.exception("Не отправил вечернее расписание в %s", key)
 
 
 async def schedule_loop() -> None:
@@ -412,7 +421,7 @@ HELP_TEXT = (
     "• <code>калл ТЕКСТ</code> — позвать всех и показать этот текст\n"
     "  (например: <code>калл собираемся на созвон через 5 минут</code>)\n\n"
     "<b>Расписание СОШ №46</b> — бот сам ходит на сайт и пишет в группу:\n"
-    "• утром присылает расписание на сегодня\n"
+    "• вечером в 18:00 (UTC+4) присылает расписание на завтра\n"
     "• если на сайте поменялись уроки или замены — зовёт всех и пишет, что изменилось\n"
     "• <code>расписание</code> — показать расписание на сегодня прямо сейчас\n"
     "• <code>изменения</code> — последний найденный дифф\n"
@@ -646,7 +655,9 @@ async def cmd_raspisanie(message: Message):
             await message.reply(part)
         return
     when = sch.get("last_check") or "неизвестно"
-    text = format_schedule_message(snap, sch.get("class_filter") or "")
+    text = format_schedule_message(
+        snap, sch.get("class_filter") or "", days_ahead=evening_days_ahead()
+    )
     text = f"Проверено: {when}\n\n" + text
     for part in _chunk_text(text):
         await message.reply(part)
