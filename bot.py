@@ -97,6 +97,9 @@ DEFAULT_EMOJI_POOL = [
     "🍀", "💎", "🌸", "🎸", "👾", "🥷", "🧊", "🌊", "🍕", "🦁",
 ]
 
+DEFAULT_CALL_TEXT = "📣 Общий сбор! Все сюда:"
+SCHEDULE_CHANGE_HEADER = "📢 Изменения в расписании школы:"
+
 BTN_TODAY = "Сегодня"
 BTN_TOMORROW = "Завтра"
 BTN_WEEK = "Неделя"
