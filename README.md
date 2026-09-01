@@ -24,7 +24,7 @@
 
 ## Расписание школы
 
-Сайт: [sosh46.ru/raspisanie](https://sosh46.ru/raspisanie/). Уроки лежат в Google-таблицах на страницах «Изменения», 1–4 и 5–11 классы.
+Сайт: [sosh46.ru/schedule](https://sosh46.ru/schedule). Уроки и замены бот берёт из API школы (`/api/schedule`).
 
 В группе бот делает это сам, команды не нужны:
 

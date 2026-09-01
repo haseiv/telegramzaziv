@@ -55,6 +55,7 @@ from aiogram.types import ChatMemberUpdated, KeyboardButton, Message, ReplyKeybo
 from schedule_watch import (
     DEFAULT_SCHOOL_URL,
     ScheduleSnapshot,
+    canonicalize_school_url,
     collect_schedule,
     describe_changes,
     format_bells,
@@ -69,7 +70,7 @@ from schedule_watch import (
 # ─────────────────────────── настройки ───────────────────────────
 
 TOKEN = os.getenv("BOT_TOKEN", "")
-SCHOOL_URL = (os.getenv("SCHOOL_URL", "") or DEFAULT_SCHOOL_URL).strip()
+SCHOOL_URL = canonicalize_school_url(os.getenv("SCHOOL_URL", "") or DEFAULT_SCHOOL_URL)
 SCHOOL_CLASS = os.getenv("SCHOOL_CLASS", "").strip()
 SCHOOL_INSECURE_SSL = os.getenv("SCHOOL_INSECURE_SSL", "").strip() in {"1", "true", "yes"}
 SCHEDULE_PARSE_START_HOUR = int(os.getenv("SCHEDULE_PARSE_START_HOUR", "8"))
@@ -154,8 +155,7 @@ def chat_bucket(chat_id: int) -> dict:
     data[key].setdefault("schedule", {})
     sch = data[key]["schedule"]
     sch.setdefault("url", SCHOOL_URL)
-    if not sch.get("url"):
-        sch["url"] = SCHOOL_URL
+    sch["url"] = canonicalize_school_url(sch.get("url") or SCHOOL_URL)
     sch.setdefault("stopped", False)
     sch.setdefault("watch", not sch.get("stopped"))
     sch.setdefault("class_filter", SCHOOL_CLASS)
@@ -680,17 +680,17 @@ async def cmd_schoolurl(message: Message, command: CommandObject):
     if not url:
         current = chat_bucket(message.chat.id)["schedule"].get("url") or SCHOOL_URL or "не задан"
         await message.reply(
-            "Использование: <code>/schoolurl https://ваш-сайт-школы.ru/raspisanie</code>\n"
+            "Использование: <code>/schoolurl https://sosh46.ru/schedule</code>\n"
             f"Сейчас: {escape(str(current))}"
         )
         return
     sch = chat_bucket(message.chat.id)["schedule"]
-    sch["url"] = url
+    sch["url"] = canonicalize_school_url(url)
     sch["snapshot"] = None
     sch["last_diff"] = ""
     save_data(data)
     await message.reply(
-        f"Сайт школы: {escape(url)}\n"
+        f"Сайт школы: {escape(sch['url'])}\n"
         "Дальше сам буду присылать расписание и изменения."
     )
 
@@ -897,7 +897,7 @@ async def bot_membership(event: ChatMemberUpdated):
     bucket = chat_bucket(event.chat.id)
     bucket["chat_type"] = event.chat.type
     sch = bucket["schedule"]
-    sch["url"] = sch.get("url") or SCHOOL_URL
+    sch["url"] = canonicalize_school_url(sch.get("url") or SCHOOL_URL)
     sch["stopped"] = False
     sch["watch"] = True
     save_data(data)

@@ -4,7 +4,9 @@ from datetime import datetime, timezone, timedelta
 from schedule_watch import (
     ScheduleFile,
     ScheduleSnapshot,
+    bells_to_text,
     build_snapshot_text,
+    canonicalize_school_url,
     describe_changes,
     extract_bells,
     filter_lines_for_class,
@@ -13,8 +15,10 @@ from schedule_watch import (
     format_day_schedule,
     google_sheets_csv_url,
     last_due_parse_slot,
+    lessons_to_text,
     next_clock_at,
     next_parse_at,
+    parse_schedule_api,
     parse_timetable_csv,
     parse_hours,
     split_class_filters,
@@ -250,6 +254,86 @@ class ScheduleParseTests(unittest.TestCase):
         self.assertEqual(nxt.day, 28)
         self.assertEqual(nxt.hour, 7)
         self.assertEqual(nxt.minute, 30)
+
+    def test_canonicalize_old_wordpress_urls(self):
+        self.assertEqual(
+            canonicalize_school_url("https://sosh46.ru/raspisanie/"),
+            "https://sosh46.ru/schedule",
+        )
+        self.assertEqual(
+            canonicalize_school_url("https://sosh46.ru/raspisanie-zvonkov/"),
+            "https://sosh46.ru/schedule",
+        )
+
+    def test_parse_new_site_api(self):
+        payload = {
+            "lessons": [
+                {
+                    "className": "10а",
+                    "day": "Среда",
+                    "time": "8.00 – 8.40",
+                    "number": 1,
+                    "subject": "Информатика",
+                    "teacher": "Тимершаехова А. Р.",
+                    "room": "303",
+                }
+            ],
+            "changes": [
+                {
+                    "id": "change-1",
+                    "className": "10а",
+                    "day": "Вторник",
+                    "time": "9.50 – 10.30",
+                    "number": 3,
+                    "subject": "Классные часы",
+                    "teacher": "",
+                    "room": "",
+                    "note": "Изменение в расписании",
+                }
+            ],
+            "bells": [
+                {
+                    "dayGroup": "regular",
+                    "shift": 1,
+                    "lesson": 1,
+                    "start": "8.00",
+                    "end": "8.40",
+                    "break": "10 мин",
+                }
+            ],
+        }
+        lessons, bells = parse_schedule_api(payload)
+        text = lessons_to_text(lessons)
+        self.assertIn("Информатика", text)
+        self.assertIn("303", text)
+        self.assertIn("Классные часы", text)
+        wednesday = datetime(2026, 9, 2, 12, 0, tzinfo=timezone(timedelta(hours=4)))
+        msg = format_day_schedule(text, class_filter="10А", now=wednesday, week=False)
+        self.assertIn("Информатика", msg)
+        self.assertNotIn("Классные часы", msg)
+        week = format_day_schedule(text, class_filter="10А", now=wednesday, week=True)
+        self.assertIn("Классные часы", week)
+        self.assertIn("Изменения", week)
+        self.assertIn("1 урок — 8.00 – 8.40", bells_to_text(payload["bells"]))
+        self.assertIn("8.00", format_bells(bells, now=wednesday))
+
+    def test_site_redesign_is_short_notice_not_huge_diff(self):
+        old = ScheduleSnapshot(
+            source_url="https://sosh46.ru/raspisanie/",
+            pages=["https://sosh46.ru/raspisanie/"],
+            text="старая таблица google",
+        )
+        new = ScheduleSnapshot(
+            source_url="https://sosh46.ru/schedule",
+            pages=["https://sosh46.ru/schedule", "https://sosh46.ru/api/schedule"],
+            text="Расписание | СРЕДА | 10а | 1. 8.00 Информатика",
+        )
+        old.fingerprint = fingerprint_of(old)
+        new.fingerprint = fingerprint_of(new)
+        report = describe_changes(old, new)
+        self.assertIsNotNone(report)
+        self.assertIn("обновился", report.lower())
+        self.assertNotIn("старая таблица", report)
 
 
 if __name__ == "__main__":
