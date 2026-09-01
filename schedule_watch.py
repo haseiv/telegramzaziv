@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -14,13 +15,8 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
-DEFAULT_SCHOOL_URL = "https://sosh46.ru/raspisanie/"
-SOSH46_PAGES = (
-    "https://sosh46.ru/raspisanie/",
-    "https://sosh46.ru/raspisanie-1-4-klass/",
-    "https://sosh46.ru/raspisanie-5-8-klass/",
-    "https://sosh46.ru/raspisanie-zvonkov/",
-)
+DEFAULT_SCHOOL_URL = "https://sosh46.ru/schedule"
+SOSH46_API_URL = "https://sosh46.ru/api/schedule"
 SCHOOL_TZ = timezone(timedelta(hours=4))  # UTC+4
 
 SCHEDULE_KEYWORDS = (
@@ -230,6 +226,100 @@ def extract_iframes(html: str, base_url: str) -> list[tuple[str, str]]:
             title = ""
         found.append((url, title))
     return found
+
+
+def canonicalize_school_url(url: str) -> str:
+    """Старые wordpress-страницы /raspisanie/ больше не существуют."""
+    url = (url or "").strip()
+    if not url:
+        return DEFAULT_SCHOOL_URL
+    host = urlparse(url).netloc.lower()
+    if host.endswith("sosh46.ru"):
+        return DEFAULT_SCHOOL_URL
+    return url
+
+
+def sosh46_schedule_api_url(source_url: str) -> str | None:
+    host = urlparse(source_url).netloc.lower()
+    path = urlparse(source_url).path.rstrip("/")
+    if host.endswith("sosh46.ru"):
+        return SOSH46_API_URL
+    if path.endswith("/api/schedule"):
+        return source_url
+    return None
+
+
+def _clean_api_text(value) -> str:
+    return _norm_space(str(value or "").replace("\n—", "/").replace("\n", " "))
+
+
+def lesson_from_api(item: dict, sheet: str) -> Lesson | None:
+    class_name = _clean_api_text(item.get("className"))
+    day = _clean_api_text(item.get("day")).upper().replace("Ё", "Е")
+    subject = _clean_api_text(item.get("subject"))
+    if not class_name or not day or not subject:
+        return None
+    teacher = _clean_api_text(item.get("teacher"))
+    room = _clean_api_text(item.get("room"))
+    note = _clean_api_text(item.get("note"))
+    bits = [subject]
+    extra = [part for part in (teacher, room) if part]
+    if extra:
+        bits.append("— " + ", ".join(extra))
+    if note and "изменен" not in note.lower():
+        bits.append(f"({note})")
+    num = str(item.get("number") if item.get("number") not in (None, "") else "?").strip()
+    return Lesson(
+        sheet=sheet,
+        day=day,
+        class_name=class_name,
+        num=num or "?",
+        time=_clean_api_text(item.get("time")),
+        subject=" ".join(bits),
+    )
+
+
+def bells_to_text(rows: Iterable[dict]) -> str:
+    labels = {
+        ("monday", 1): "Понедельник, 1 смена",
+        ("monday", 2): "Понедельник, 2 смена",
+        ("regular", 1): "Вторник–суббота, 1 смена",
+        ("regular", 2): "Вторник–суббота, 2 смена",
+    }
+    groups: dict[tuple, list[str]] = {}
+    order: list[tuple] = []
+    for row in rows:
+        key = (row.get("dayGroup"), row.get("shift"))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        n = row.get("lesson")
+        start = row.get("start") or ""
+        end = row.get("end") or ""
+        brk = _clean_api_text(row.get("break"))
+        line = f"{n} урок — {start} – {end}"
+        if brk:
+            line += f" (перемена {brk})"
+        groups[key].append(line)
+    chunks: list[str] = []
+    for key in order:
+        chunks.append(labels.get(key, f"{key[0]} · смена {key[1]}"))
+        chunks.extend(groups[key])
+        chunks.append("")
+    return "\n".join(chunks).strip()
+
+
+def parse_schedule_api(payload: dict) -> tuple[list[Lesson], str]:
+    lessons: list[Lesson] = []
+    for item in payload.get("lessons") or []:
+        lesson = lesson_from_api(item, "Расписание")
+        if lesson:
+            lessons.append(lesson)
+    for item in payload.get("changes") or []:
+        lesson = lesson_from_api(item, "Изменения")
+        if lesson:
+            lessons.append(lesson)
+    return lessons, bells_to_text(payload.get("bells") or [])
 
 
 def google_sheets_csv_url(url: str) -> str | None:
@@ -600,23 +690,13 @@ def format_bells(bells: str, now: datetime | None = None) -> str:
     if not bells.strip():
         return (
             f"{header}\nНа сайте сетка звонков сейчас не разобралась.\n"
-            "https://sosh46.ru/raspisanie-zvonkov/"
+            f"{DEFAULT_SCHOOL_URL}"
         )
     weekday = school_now(now).weekday()
     label = "сегодня понедельник" if weekday == 0 else "сегодня вторник–суббота"
     if weekday == 6:
         label = "сегодня воскресенье"
-    return f"{header} ({label})\n\n{bells}\n\nhttps://sosh46.ru/raspisanie-zvonkov/"
-    path = urlparse(page_url).path.lower()
-    if "1-4" in path:
-        return "1-4 классы"
-    if "5-8" in path or "5-11" in path:
-        return "5-11 классы"
-    if "zvonk" in path:
-        return "Звонки"
-    if "raspisanie" in path:
-        return "Изменения"
-    return fallback
+    return f"{header} ({label})\n\n{bells}\n\n{DEFAULT_SCHOOL_URL}"
 
 
 def build_snapshot_text(page_url: str, html: str, class_filter: str = "") -> tuple[str, list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
@@ -647,6 +727,20 @@ def fingerprint_of(snapshot: ScheduleSnapshot) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _page_blob(snap: ScheduleSnapshot) -> str:
+    return " ".join([snap.source_url, *snap.pages]).lower()
+
+
+def _is_legacy_sosh_snapshot(snap: ScheduleSnapshot) -> bool:
+    blob = _page_blob(snap)
+    return "sosh46.ru" in blob and "raspisanie" in blob
+
+
+def _is_new_sosh_snapshot(snap: ScheduleSnapshot) -> bool:
+    blob = _page_blob(snap)
+    return "sosh46.ru" in blob and ("/schedule" in blob or "/api/schedule" in blob)
+
+
 def describe_changes(
     old: ScheduleSnapshot | None,
     new: ScheduleSnapshot,
@@ -655,6 +749,9 @@ def describe_changes(
         return None
     if old.fingerprint == new.fingerprint:
         return None
+
+    if _is_legacy_sosh_snapshot(old) and _is_new_sosh_snapshot(new):
+        return "Сайт СОШ №46 обновился. Дальше слежу за новым расписанием и заменами."
 
     lines: list[str] = []
 
@@ -722,11 +819,10 @@ async def _fetch(session, url: str, ssl: bool | None) -> tuple[bytes, str, str]:
 
 
 def seed_pages(source_url: str) -> list[str]:
+    source_url = canonicalize_school_url(source_url)
     pages = [source_url]
     if "sosh46.ru" in source_url:
-        for extra in SOSH46_PAGES:
-            if extra.rstrip("/") not in {p.rstrip("/") for p in pages}:
-                pages.append(extra)
+        return [DEFAULT_SCHOOL_URL]
     return pages
 
 
@@ -741,10 +837,27 @@ async def collect_schedule(
 
     ssl: bool | None = False if insecure_ssl else None
     own_session = session is None
+    source_url = canonicalize_school_url(source_url)
     if own_session:
         session = aiohttp.ClientSession()
     try:
         snap = ScheduleSnapshot(source_url=source_url)
+        api_url = sosh46_schedule_api_url(source_url)
+        if api_url:
+            try:
+                raw, final_url, _ctype = await _fetch(session, api_url, ssl)
+                payload = json.loads(decode_bytes(raw))
+                lessons, bells = parse_schedule_api(payload)
+                snap.pages = [DEFAULT_SCHOOL_URL, final_url]
+                snap.bells = bells
+                snap.text = lessons_to_text(lessons)[:MAX_TEXT_CHARS]
+                if not snap.text:
+                    snap.text = "На сайте сейчас нет уроков."
+                snap.fingerprint = fingerprint_of(snap)
+                return snap
+            except Exception:
+                pass
+
         texts: list[str] = []
         file_queue: list[tuple[str, str]] = []
         sheet_queue: list[tuple[str, str]] = []
@@ -851,10 +964,13 @@ async def preview(class_filter: str = "") -> None:
     print("Снимок:", snap.fingerprint[:16], "символов:", len(snap.text))
     print()
     print("===== сегодня =====")
-    print(format_day_schedule(snap.text, class_filter=class_filter, days_ahead=0))
+    print(format_day_schedule(snap.text, class_filter=class_filter, days_ahead=0, week=False))
     print()
     print("===== завтра =====")
-    print(format_day_schedule(snap.text, class_filter=class_filter, days_ahead=1))
+    print(format_day_schedule(snap.text, class_filter=class_filter, days_ahead=1, week=False))
+    print()
+    print("===== неделя =====")
+    print(format_day_schedule(snap.text, class_filter=class_filter, week=True))
 
 
 if __name__ == "__main__":
