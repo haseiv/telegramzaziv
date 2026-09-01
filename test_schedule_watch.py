@@ -12,12 +12,14 @@ from schedule_watch import (
     filter_lines_for_class,
     fingerprint_of,
     format_bells,
+    format_changes_schedule,
     format_day_schedule,
     google_sheets_csv_url,
     last_due_parse_slot,
     lessons_to_text,
     next_clock_at,
     next_parse_at,
+    parse_next_flight_payload,
     parse_schedule_api,
     parse_timetable_csv,
     parse_hours,
@@ -334,6 +336,53 @@ class ScheduleParseTests(unittest.TestCase):
         self.assertIsNotNone(report)
         self.assertIn("обновился", report.lower())
         self.assertNotIn("старая таблица", report)
+
+    def test_empty_today_hints_other_days(self):
+        text = "Расписание | СРЕДА | 10а | 1. 8.00 Информатика"
+        tuesday = datetime(2026, 9, 1, 12, 0, tzinfo=timezone(timedelta(hours=4)))
+        msg = format_day_schedule(text, class_filter="10А", now=tuesday, week=False)
+        self.assertIn("пусто", msg.lower())
+        self.assertIn("СРЕДА", msg)
+        self.assertIn("неделя", msg)
+
+    def test_changes_from_snapshot_not_last_diff(self):
+        payload = {
+            "lessons": [],
+            "changes": [
+                {
+                    "id": "change-1",
+                    "className": "5а",
+                    "day": "Вторник",
+                    "time": "9.50 – 10.30",
+                    "number": 3,
+                    "subject": "Классные часы",
+                    "teacher": "",
+                    "room": "",
+                    "note": "Изменение в расписании",
+                }
+            ],
+            "bells": [],
+        }
+        lessons, _bells = parse_schedule_api(payload)
+        text = lessons_to_text(lessons)
+        msg = format_changes_schedule(text, "5А")
+        self.assertIn("Классные часы", msg)
+        empty = format_changes_schedule(text, "10А")
+        self.assertIn("нет", empty.lower())
+
+    def test_parse_next_flight_chunks(self):
+        html = (
+            '<script>self.__next_f.push([1,"14:{\\"className\\":\\"10а\\",'
+            '\\"day\\":\\"Среда\\",\\"time\\":\\"8.00\\",\\"number\\":1,'
+            '\\"subject\\":\\"Информатика\\",\\"teacher\\":\\"T\\",\\"room\\":\\"303\\"}\\n"])</script>'
+            '<script>self.__next_f.push([1,"101:{\\"id\\":\\"change-1\\",\\"className\\":\\"5а\\",'
+            '\\"day\\":\\"Вторник\\",\\"time\\":\\"9.50\\",\\"number\\":3,'
+            '\\"subject\\":\\"Классные часы\\",\\"teacher\\":\\"\\",\\"room\\":\\"\\",'
+            '\\"note\\":\\"Изменение в расписании\\"}\\n"])</script>'
+        )
+        payload = parse_next_flight_payload(html)
+        self.assertEqual(payload["lessons"][0]["subject"], "Информатика")
+        self.assertEqual(payload["changes"][0]["subject"], "Классные часы")
 
 
 if __name__ == "__main__":

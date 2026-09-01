@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,8 @@ USER_AGENT = (
     "Mozilla/5.0 (compatible; ZazyvalkinBot/1.0; +https://t.me/) "
     "AppleWebKit/537.36 Chrome/120.0.0.0"
 )
+
+log = logging.getLogger("zazyvalkin.schedule")
 
 DAY_NAMES = (
     "понедельник",
@@ -322,6 +325,63 @@ def parse_schedule_api(payload: dict) -> tuple[list[Lesson], str]:
     return lessons, bells_to_text(payload.get("bells") or [])
 
 
+def parse_next_flight_payload(html: str) -> dict:
+    """Достаёт уроки/замены/звонки из RSC-страницы, если /api/schedule недоступен."""
+    blob_parts: list[str] = []
+    for match in re.finditer(r"self\.__next_f\.push\(\[1,(\"(?:\\.|[^\"\\])*\")\]\)", html):
+        try:
+            blob_parts.append(json.loads(match.group(1)))
+        except json.JSONDecodeError:
+            continue
+    blob = "".join(blob_parts) if blob_parts else html
+    lessons: list[dict] = []
+    changes: list[dict] = []
+    bells: list[dict] = []
+    seen: set[str] = set()
+    decoder = json.JSONDecoder()
+    for prefix in ('{"className":', '{"dayGroup":', '{"id":"change'):
+        idx = 0
+        while True:
+            found = blob.find(prefix, idx)
+            if found < 0:
+                break
+            brace = blob.rfind("{", 0, found + 1)
+            try:
+                obj, end = decoder.raw_decode(blob, brace)
+            except json.JSONDecodeError:
+                idx = found + 1
+                continue
+            idx = end
+            if not isinstance(obj, dict):
+                continue
+            key = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            if obj.get("dayGroup") is not None and obj.get("lesson") is not None:
+                bells.append(obj)
+            elif obj.get("className") and obj.get("day"):
+                if str(obj.get("id") or "").startswith("change") or obj.get("note"):
+                    changes.append(obj)
+                else:
+                    lessons.append(obj)
+    return {"lessons": lessons, "changes": changes, "bells": bells}
+
+
+def snapshot_from_payload(payload: dict, source_url: str, pages: list[str]) -> ScheduleSnapshot:
+    lessons, bells = parse_schedule_api(payload)
+    snap = ScheduleSnapshot(source_url=source_url, pages=pages, bells=bells)
+    snap.text = lessons_to_text(lessons)[:MAX_TEXT_CHARS]
+    if not snap.text:
+        snap.text = "На сайте сейчас нет уроков."
+    snap.fingerprint = fingerprint_of(snap)
+    return snap
+
+
+def has_lesson_lines(text: str) -> bool:
+    return any(parse_lesson_line(line) for line in (text or "").splitlines())
+
+
 def google_sheets_csv_url(url: str) -> str | None:
     parsed = urlparse(unescape(url))
     if "docs.google.com" not in parsed.netloc or "/spreadsheets/d/e/" not in parsed.path:
@@ -534,6 +594,25 @@ def format_day_schedule(
 
     if not standard and not changes:
         hint = f" ({class_filter})" if class_filter else ""
+        other_days: list[str] = []
+        if class_filter and not week:
+            seen_days: set[str] = set()
+            for line in text.splitlines():
+                parsed = parse_lesson_line(line)
+                if not parsed:
+                    continue
+                _sheet, day, klass, _lesson = parsed
+                if class_matches(klass, class_filter) and day not in seen_days:
+                    seen_days.add(day)
+                    other_days.append(day)
+            if other_days:
+                shown = ", ".join(other_days)
+                return (
+                    f"{header}\nНа этот день в сетке пока пусто. "
+                    f"На сайте сейчас есть: {shown}.\n"
+                    f"Напишите «неделя», чтобы увидеть всё.\n"
+                    f"{DEFAULT_SCHOOL_URL}"
+                )
         return (
             f"{header}\nВ стандартном расписании нет уроков{hint}. "
             f"Проверьте написание класса (например 10А).\n"
@@ -555,6 +634,31 @@ def format_day_schedule(
 
     body = "\n".join(chunks)
     return body + f"\n\nИсточник: {DEFAULT_SCHOOL_URL}"
+
+
+def format_changes_schedule(text: str, class_filter: str = "") -> str:
+    rows: list[tuple[str, str, str, str]] = []
+    for line in text.splitlines():
+        parsed = parse_lesson_line(line)
+        if not parsed:
+            continue
+        sheet, day, klass, lesson = parsed
+        if not is_changes_sheet(sheet):
+            continue
+        if class_filter and not class_matches(klass, class_filter):
+            continue
+        rows.append((sheet, day, klass, lesson))
+    header = "⚠ Замены СОШ №46"
+    if class_filter:
+        header += f" ({class_filter})"
+    if not rows:
+        return (
+            f"{header}\nЗамен на сайте сейчас нет — действует обычное расписание.\n\n"
+            f"Источник: {DEFAULT_SCHOOL_URL}"
+        )
+    chunks = [header]
+    chunks.extend(_format_grouped_lessons(rows, by_day=True))
+    return "\n".join(chunks) + f"\n\nИсточник: {DEFAULT_SCHOOL_URL}"
 
 
 def _format_grouped_lessons(
@@ -810,7 +914,11 @@ async def _fetch(session, url: str, ssl: bool | None) -> tuple[bytes, str, str]:
     import aiohttp
 
     timeout = aiohttp.ClientTimeout(total=25)
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "ru,en;q=0.8"}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/html;q=0.8, */*;q=0.5",
+        "Accept-Language": "ru,en;q=0.8",
+    }
     async with session.get(url, timeout=timeout, headers=headers, ssl=ssl, allow_redirects=True) as resp:
         resp.raise_for_status()
         data = await resp.read()
@@ -847,16 +955,25 @@ async def collect_schedule(
             try:
                 raw, final_url, _ctype = await _fetch(session, api_url, ssl)
                 payload = json.loads(decode_bytes(raw))
-                lessons, bells = parse_schedule_api(payload)
-                snap.pages = [DEFAULT_SCHOOL_URL, final_url]
-                snap.bells = bells
-                snap.text = lessons_to_text(lessons)[:MAX_TEXT_CHARS]
-                if not snap.text:
-                    snap.text = "На сайте сейчас нет уроков."
-                snap.fingerprint = fingerprint_of(snap)
-                return snap
+                if not isinstance(payload, dict):
+                    raise ValueError("API расписания вернул не объект")
+                snap = snapshot_from_payload(
+                    payload, source_url, [DEFAULT_SCHOOL_URL, str(final_url)]
+                )
+                if has_lesson_lines(snap.text):
+                    return snap
             except Exception:
-                pass
+                log.exception("Не удалось прочитать %s", api_url)
+            try:
+                raw, final_url, _ctype = await _fetch(session, DEFAULT_SCHOOL_URL, ssl)
+                payload = parse_next_flight_payload(decode_bytes(raw))
+                snap = snapshot_from_payload(
+                    payload, source_url, [DEFAULT_SCHOOL_URL, str(final_url)]
+                )
+                if has_lesson_lines(snap.text):
+                    return snap
+            except Exception:
+                log.exception("Не удалось разобрать HTML %s", DEFAULT_SCHOOL_URL)
 
         texts: list[str] = []
         file_queue: list[tuple[str, str]] = []
