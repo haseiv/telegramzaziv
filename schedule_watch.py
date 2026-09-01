@@ -7,7 +7,9 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -18,6 +20,16 @@ from bs4 import BeautifulSoup, Tag
 
 DEFAULT_SCHOOL_URL = "https://sosh46.ru/schedule"
 SOSH46_API_URL = "https://sosh46.ru/api/schedule"
+# Таблица, куда на сайте пишут сетку (тот же ID, что в админке sosh46.ru).
+SOSH46_SHEET_ID = os.getenv(
+    "SOSH46_SHEET_ID",
+    "1uEvu2RU9JT67n4erJu6U0F2sS2MxZGeh1QmTd8qfZ-Q",
+)
+SOSH46_SHEET_TABS = (
+    ("2114544105", "1-4 классы"),
+    ("0", "5-11 классы"),
+    ("656166446", "Изменения"),
+)
 SCHOOL_TZ = timezone(timedelta(hours=4))  # UTC+4
 
 SCHEDULE_KEYWORDS = (
@@ -382,6 +394,13 @@ def has_lesson_lines(text: str) -> bool:
     return any(parse_lesson_line(line) for line in (text or "").splitlines())
 
 
+def google_sheet_csv_export_url(spreadsheet_id: str, gid: str) -> str:
+    return (
+        f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export"
+        f"?format=csv&gid={gid}"
+    )
+
+
 def google_sheets_csv_url(url: str) -> str | None:
     parsed = urlparse(unescape(url))
     if "docs.google.com" not in parsed.netloc or "/spreadsheets/d/e/" not in parsed.path:
@@ -426,7 +445,7 @@ def parse_timetable_csv(csv_text: str, sheet: str = "Расписание") -> l
             continue
         if not day:
             continue
-        if cells and cells[0].lower().startswith("кабинет"):
+        if cells and cells[0].lower().startswith(("кабинет", "педагог")):
             continue
         if _is_class_header(cells) and (not cells[1] or not cells[1].isdigit()):
             # class names start after time/number columns
@@ -466,6 +485,53 @@ def parse_timetable_csv(csv_text: str, sheet: str = "Расписание") -> l
 
 def lessons_to_text(lessons: Iterable[Lesson]) -> str:
     return "\n".join(les.line() for les in lessons)
+
+
+def infer_sheet_kind(lessons: list[Lesson]) -> str:
+    """Вкладка «Изменения» часто содержит обычную сетку. Редкие ячейки — замены."""
+    if not lessons:
+        return "Расписание"
+    per_class_day = Counter((normalize_class_name(item.class_name), item.day) for item in lessons)
+    avg = sum(per_class_day.values()) / max(len(per_class_day), 1)
+    return "Изменения" if avg <= 1.5 else "Расписание"
+
+
+def lessons_with_sheet(lessons: Iterable[Lesson], sheet: str) -> list[Lesson]:
+    return [
+        Lesson(
+            sheet=sheet,
+            day=item.day,
+            class_name=item.class_name,
+            num=item.num,
+            time=item.time,
+            subject=item.subject,
+        )
+        for item in lessons
+    ]
+
+
+def lesson_slot_key(item: Lesson) -> tuple:
+    return (
+        normalize_class_name(item.class_name),
+        item.day,
+        str(item.num),
+        is_changes_sheet(item.sheet),
+    )
+
+
+def merge_lessons(primary: list[Lesson], extra: list[Lesson]) -> list[Lesson]:
+    index = {lesson_slot_key(item): i for i, item in enumerate(primary)}
+    out = list(primary)
+    for item in extra:
+        key = lesson_slot_key(item)
+        if key not in index:
+            index[key] = len(out)
+            out.append(item)
+            continue
+        i = index[key]
+        if len(item.subject) > len(out[i].subject):
+            out[i] = item
+    return out
 
 
 LAT_TO_CYR = str.maketrans({
@@ -545,6 +611,42 @@ def filter_lines_for_class(text: str, class_name: str) -> str:
     return "\n".join(kept)
 
 
+def classes_in_snapshot(text: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        parsed = parse_lesson_line(line)
+        if not parsed:
+            continue
+        klass = parsed[2]
+        key = normalize_class_name(klass)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(klass)
+
+    def sort_key(name: str) -> tuple:
+        match = re.match(r"^(\d+)(.*)$", normalize_class_name(name))
+        if not match:
+            return (99, name)
+        return (int(match.group(1)), match.group(2))
+
+    return sorted(found, key=sort_key)
+
+
+def sibling_classes(needle: str, text: str) -> list[str]:
+    grade_match = re.match(r"^(\d+)", normalize_class_name(needle))
+    if not grade_match:
+        return []
+    grade = grade_match.group(1)
+    return [
+        klass
+        for klass in classes_in_snapshot(text)
+        if normalize_class_name(klass).startswith(grade)
+        and not class_matches(klass, needle)
+    ]
+
+
 def format_day_schedule(
     text: str,
     *,
@@ -613,9 +715,20 @@ def format_day_schedule(
                     f"Напишите «неделя», чтобы увидеть всё.\n"
                     f"{DEFAULT_SCHOOL_URL}"
                 )
+        if class_filter:
+            siblings = sibling_classes(class_filter, text)
+            extra = (
+                f"Сейчас в параллели есть: {', '.join(siblings)}.\n"
+                if siblings
+                else "Проверьте написание (например 8А или 8Д).\n"
+            )
+            return (
+                f"{header}\nВ таблице нет класса {class_filter}. {extra}"
+                f"{DEFAULT_SCHOOL_URL}"
+            )
         return (
-            f"{header}\nВ стандартном расписании нет уроков{hint}. "
-            f"Проверьте написание класса (например 10А).\n"
+            f"{header}\nВ стандартном расписании нет уроков. "
+            f"Напишите класс, например <code>класс 8Д</code>.\n"
             f"{DEFAULT_SCHOOL_URL}"
         )
 
@@ -928,10 +1041,47 @@ async def _fetch(session, url: str, ssl: bool | None) -> tuple[bytes, str, str]:
 
 def seed_pages(source_url: str) -> list[str]:
     source_url = canonicalize_school_url(source_url)
-    pages = [source_url]
     if "sosh46.ru" in source_url:
         return [DEFAULT_SCHOOL_URL]
-    return pages
+    return [source_url]
+
+
+async def collect_sosh46(session, ssl) -> ScheduleSnapshot | None:
+    pages: list[str] = []
+    sheet_lessons: list[Lesson] = []
+    for gid, title in SOSH46_SHEET_TABS:
+        url = google_sheet_csv_export_url(SOSH46_SHEET_ID, gid)
+        try:
+            raw, final_url, _ctype = await _fetch(session, url, ssl)
+            pages.append(str(final_url))
+            parsed = parse_timetable_csv(decode_bytes(raw), sheet=title)
+            kind = infer_sheet_kind(parsed)
+            sheet_lessons.extend(lessons_with_sheet(parsed, kind))
+        except Exception:
+            log.exception("Не удалось скачать вкладку расписания gid=%s", gid)
+
+    api_lessons: list[Lesson] = []
+    bells = ""
+    try:
+        raw, final_url, _ctype = await _fetch(session, SOSH46_API_URL, ssl)
+        pages.append(str(final_url))
+        payload = json.loads(decode_bytes(raw))
+        if isinstance(payload, dict):
+            api_lessons, bells = parse_schedule_api(payload)
+    except Exception:
+        log.exception("Не удалось прочитать %s", SOSH46_API_URL)
+
+    lessons = merge_lessons(sheet_lessons, api_lessons)
+    if not lessons and not bells:
+        return None
+    snap = ScheduleSnapshot(
+        source_url=DEFAULT_SCHOOL_URL,
+        pages=pages or [DEFAULT_SCHOOL_URL],
+        bells=bells,
+        text=lessons_to_text(lessons)[:MAX_TEXT_CHARS] or "На сайте сейчас нет уроков.",
+    )
+    snap.fingerprint = fingerprint_of(snap)
+    return snap
 
 
 async def collect_schedule(
@@ -950,20 +1100,10 @@ async def collect_schedule(
         session = aiohttp.ClientSession()
     try:
         snap = ScheduleSnapshot(source_url=source_url)
-        api_url = sosh46_schedule_api_url(source_url)
-        if api_url:
-            try:
-                raw, final_url, _ctype = await _fetch(session, api_url, ssl)
-                payload = json.loads(decode_bytes(raw))
-                if not isinstance(payload, dict):
-                    raise ValueError("API расписания вернул не объект")
-                snap = snapshot_from_payload(
-                    payload, source_url, [DEFAULT_SCHOOL_URL, str(final_url)]
-                )
-                if has_lesson_lines(snap.text):
-                    return snap
-            except Exception:
-                log.exception("Не удалось прочитать %s", api_url)
+        if sosh46_schedule_api_url(source_url):
+            sosh = await collect_sosh46(session, ssl)
+            if sosh and has_lesson_lines(sosh.text):
+                return sosh
             try:
                 raw, final_url, _ctype = await _fetch(session, DEFAULT_SCHOOL_URL, ssl)
                 payload = parse_next_flight_payload(decode_bytes(raw))
