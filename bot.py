@@ -59,6 +59,7 @@ from schedule_watch import (
     collect_schedule,
     describe_changes,
     format_bells,
+    format_changes_schedule,
     format_day_schedule,
     last_due_parse_slot,
     next_clock_at,
@@ -723,7 +724,7 @@ async def apply_class_filter(message: Message, value: str) -> None:
         f"Класс <b>{escape(value)}</b>. Это обычное расписание на неделю. "
         "Замены пришлю отдельно, когда их выложат."
     )
-    for part in _chunk_text(format_schedule_message(snap, value, days_ahead=0)):
+    for part in _chunk_text(format_schedule_message(snap, value, days_ahead=0, week=True)):
         await message.reply(part, reply_markup=schedule_keyboard())
 
 
@@ -777,12 +778,9 @@ async def cmd_schoolcheck(message: Message):
 
 
 async def ensure_snapshot(chat_id: int):
+    await refresh_schedule(chat_id, notify=False)
     sch = chat_bucket(chat_id)["schedule"]
     snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
-    if snap is None:
-        await refresh_schedule(chat_id, notify=False)
-        sch = chat_bucket(chat_id)["schedule"]
-        snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
     return snap, sch.get("class_filter") or ""
 
 
@@ -825,18 +823,11 @@ async def cmd_bells(message: Message):
 @dp.message(Command("изменения", "izmeneniya", "changes", "замены"))
 async def cmd_izmeneniya(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    sch = chat_bucket(message.chat.id)["schedule"]
-    diff = sch.get("last_diff") or ""
-    if not diff:
-        await message.reply(
-            "Замен на сайте сейчас нет — действует обычное расписание.",
-            reply_markup=schedule_keyboard(),
-        )
+    snap, klass = await ensure_snapshot(message.chat.id)
+    if not snap:
+        await message.reply("Пока нет снимка с сайта. Напишите <code>класс 10А</code>.")
         return
-    when = sch.get("last_change") or ""
-    text = f"{SCHEDULE_CHANGE_HEADER}\n{diff}"
-    if when:
-        text += f"\n\nЗафиксировано: {when}"
+    text = format_changes_schedule(snap.text, klass)
     for part in _chunk_text(text):
         await message.reply(part, reply_markup=schedule_keyboard())
 
