@@ -36,7 +36,7 @@
 По желанию:
 
 ```
-класс 10А                # сетка класса на неделю (можно 10А, 10Б)
+класс 9Д                 # сетка класса на неделю (можно просто 9д)
 Сегодня / Завтра / Неделя
 Замены / Звонки
 калл
@@ -53,7 +53,7 @@ Bot API **не отдаёт полный список участников гр�
 ```bash
 python3 -m unittest test_schedule_watch.py
 python3 schedule_watch.py
-python3 schedule_watch.py 8А
+python3 schedule_watch.py 9Д
 ```
 
 В Telegram:

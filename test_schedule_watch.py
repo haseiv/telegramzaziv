@@ -232,6 +232,8 @@ class ScheduleParseTests(unittest.TestCase):
     def test_split_classes(self):
         self.assertEqual(split_class_filters("10А, 10Б"), ["10А", "10Б"])
         self.assertEqual(split_class_filters("класс 8А и 8В"), ["8А", "8В"])
+        self.assertEqual(split_class_filters("9д бля"), ["9д"])
+        self.assertEqual(split_class_filters("9Д"), ["9Д"])
 
     def test_extract_bells(self):
         html = """
