@@ -72,7 +72,7 @@ from schedule_watch import (
 
 TOKEN = os.getenv("BOT_TOKEN", "")
 SCHOOL_URL = canonicalize_school_url(os.getenv("SCHOOL_URL", "") or DEFAULT_SCHOOL_URL)
-SCHOOL_CLASS = os.getenv("SCHOOL_CLASS", "").strip()
+SCHOOL_CLASS = os.getenv("SCHOOL_CLASS", "9Д").strip()
 SCHOOL_INSECURE_SSL = os.getenv("SCHOOL_INSECURE_SSL", "").strip() in {"1", "true", "yes"}
 SCHEDULE_PARSE_START_HOUR = int(os.getenv("SCHEDULE_PARSE_START_HOUR", "8"))
 SCHEDULE_PARSE_EVERY_HOURS = max(1, int(os.getenv("SCHEDULE_PARSE_EVERY_HOURS", "2")))
@@ -118,7 +118,7 @@ def schedule_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="класс 10А  ·  Сегодня  ·  калл",
+        input_field_placeholder="класс 9Д  ·  Сегодня  ·  калл",
     )
 
 # сколько упоминаний в одном сообщении (Telegram не любит очень длинные)
@@ -371,7 +371,7 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
             else:
                 await send_plain(
                     chat_id,
-                    "Слежу за сайтом СОШ №46. Напишите <code>класс 10А</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя.",
+                    "Слежу за сайтом СОШ №46. Напишите <code>класс 9Д</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя.",
                     reply_markup=schedule_keyboard(),
                 )
             return "Запомнил расписание. Дальше напишу сам, если появятся замены."
@@ -547,7 +547,7 @@ HELP_TEXT = (
     "<b>Зазывалкин</b>\n\n"
     "• <code>калл</code> — позвать всех\n"
     "• кнопки внизу: Сегодня, Завтра, Неделя, Замены, Звонки\n"
-    "• <code>класс 8Д</code> — обычная сетка этого класса (можно <code>8Д, 8А</code>)\n"
+    "• <code>класс 9Д</code> — обычная сетка этого класса (можно просто <code>9д</code>)\n"
     "• утром в 7:30 (UTC+4) — расписание на сегодня\n"
     "• в 18:00 (UTC+4) — расписание на завтра\n"
     "• каждые 2 часа с 8:00 проверяет сайт и зовёт всех, только если появились замены\n\n"
@@ -702,7 +702,7 @@ async def apply_class_filter(message: Message, value: str) -> None:
     if not value:
         current = sch.get("class_filter") or "не выбран"
         await message.reply(
-            "Напишите <code>класс 10А</code> или <code>/schoolclass 10А</code>.\n"
+            "Напишите <code>класс 9Д</code> или просто <code>9д</code>.\n"
             f"Сейчас: {escape(str(current))}"
         )
         return
@@ -711,6 +711,8 @@ async def apply_class_filter(message: Message, value: str) -> None:
         save_data(data)
         await message.reply("Фильтр класса снят.")
         return
+    parts = [p for p in split_class_filters(value) if p]
+    value = ", ".join(parts) or value
     sch["class_filter"] = value
     save_data(data)
     await refresh_schedule(message.chat.id, notify=False)
@@ -787,7 +789,7 @@ async def ensure_snapshot(chat_id: int):
 async def reply_schedule_view(message: Message, *, days_ahead: int = 0, week: bool = False) -> None:
     snap, klass = await ensure_snapshot(message.chat.id)
     if not snap:
-        await message.reply("Пока нет снимка с сайта. Напишите <code>класс 10А</code>.")
+        await message.reply("Пока нет снимка с сайта. Напишите <code>класс 9Д</code>.")
         return
     text = format_schedule_message(snap, klass, days_ahead=days_ahead, week=week)
     for part in _chunk_text(text):
@@ -825,7 +827,7 @@ async def cmd_izmeneniya(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
     snap, klass = await ensure_snapshot(message.chat.id)
     if not snap:
-        await message.reply("Пока нет снимка с сайта. Напишите <code>класс 10А</code>.")
+        await message.reply("Пока нет снимка с сайта. Напишите <code>класс 9Д</code>.")
         return
     text = format_changes_schedule(snap.text, klass)
     for part in _chunk_text(text):
@@ -835,6 +837,10 @@ async def cmd_izmeneniya(message: Message):
 _btn_re = re.compile(r"^(сегодня|завтра|неделя|замены|звонки)$", re.IGNORECASE)
 _rasp_re = re.compile(r"^/?(расписание|изменения)(?:@\w+)?(?:\s+(\S.*))?$", re.IGNORECASE)
 _class_re = re.compile(r"^/?(класс|class)(?:@\w+)?\s+(\S.*)$", re.IGNORECASE)
+_bare_class_re = re.compile(
+    r"^(\d{1,2}\s*[а-яёa-z](?:\s*[,;/]\s*\d{1,2}\s*[а-яёa-z])*)$",
+    re.IGNORECASE,
+)
 
 @dp.message(F.text.regexp(_btn_re))
 async def text_buttons(message: Message):
@@ -857,6 +863,12 @@ async def text_class(message: Message):
     m = _class_re.match(message.text.strip())
     args = m.group(2).strip() if m else ""
     await apply_class_filter(message, args)
+
+
+@dp.message(F.text.regexp(_bare_class_re))
+async def text_bare_class(message: Message):
+    remember_user(message.chat.id, message.from_user, message.chat.type)
+    await apply_class_filter(message, message.text.strip())
 
 
 @dp.message(F.text.regexp(_rasp_re))
@@ -895,7 +907,7 @@ async def bot_membership(event: ChatMemberUpdated):
     try:
         await bot.send_message(
             event.chat.id,
-            "Я Зазывалкин. Напишите <code>класс 10А</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя, Замены, Звонки.",
+            "Я Зазывалкин. Напишите <code>класс 9Д</code> или просто <code>9д</code>.",
             reply_markup=schedule_keyboard(),
         )
         await refresh_schedule(event.chat.id, notify=False)

@@ -581,7 +581,12 @@ def split_class_filters(raw: str) -> list[str]:
     out: list[str] = []
     for part in parts:
         part = re.sub(r"^класс\s+", "", _norm_space(part), flags=re.I)
-        if part:
+        if not part:
+            continue
+        match = re.match(r"^(\d{1,2}\s*[а-яёa-z])", part, flags=re.I)
+        if match:
+            out.append(re.sub(r"\s+", "", match.group(1)))
+        else:
             out.append(part)
     return out or [""]
 
@@ -719,7 +724,7 @@ def format_day_schedule(
             extra = (
                 f"Сейчас в параллели есть: {', '.join(siblings)}.\n"
                 if siblings
-                else "Проверьте написание (например 8А или 8Д).\n"
+                else "Проверьте написание (например 9Д).\n"
             )
             return (
                 f"{header}\nВ таблице нет класса {class_filter}. {extra}"
@@ -727,7 +732,7 @@ def format_day_schedule(
             )
         return (
             f"{header}\nВ стандартном расписании нет уроков. "
-            f"Напишите класс, например <code>класс 8Д</code>.\n"
+            f"Напишите класс, например <code>класс 9Д</code>.\n"
             f"{DEFAULT_SCHOOL_URL}"
         )
 
