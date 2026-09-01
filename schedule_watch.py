@@ -695,7 +695,6 @@ def format_day_schedule(
         )
 
     if not standard and not changes:
-        hint = f" ({class_filter})" if class_filter else ""
         other_days: list[str] = []
         if class_filter and not week:
             seen_days: set[str] = set()
