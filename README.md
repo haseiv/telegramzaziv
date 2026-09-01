@@ -24,7 +24,7 @@
 
 ## Расписание школы
 
-Сайт: [sosh46.ru/schedule](https://sosh46.ru/schedule). Уроки и замены бот берёт из API школы (`/api/schedule`).
+Сайт: [sosh46.ru/schedule](https://sosh46.ru/schedule). Бот читает Google-таблицу расписания (туда пишут сетку) и API `/api/schedule` (звонки и замены).
 
 В группе бот делает это сам, команды не нужны:
 

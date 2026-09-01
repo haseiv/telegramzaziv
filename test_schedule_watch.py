@@ -15,6 +15,7 @@ from schedule_watch import (
     format_changes_schedule,
     format_day_schedule,
     google_sheets_csv_url,
+    infer_sheet_kind,
     last_due_parse_slot,
     lessons_to_text,
     next_clock_at,
@@ -383,6 +384,39 @@ class ScheduleParseTests(unittest.TestCase):
         payload = parse_next_flight_payload(html)
         self.assertEqual(payload["lessons"][0]["subject"], "Информатика")
         self.assertEqual(payload["changes"][0]["subject"], "Классные часы")
+
+    def test_sheet_tab_with_one_lesson_is_changes(self):
+        csv_text = """ВТОРНИК,,,,,,,,
+,,8А,8Б
+9.50 – 10.30,3,Классные часы,Классные часы
+"""
+        lessons = parse_timetable_csv(csv_text, sheet="5-11")
+        self.assertEqual(infer_sheet_kind(lessons), "Изменения")
+
+    def test_sheet_tab_with_full_day_is_schedule(self):
+        csv_text = """СРЕДА,,,,,,,,
+,,8А
+8.00 – 8.40,1,Алгебра
+8.50 – 9.30,2,История
+9.50 – 10.30,3,Физика
+10.50 – 11.30,4,Русский
+11.50 – 12.30,5,Химия
+"""
+        lessons = parse_timetable_csv(csv_text, sheet="Изменения")
+        self.assertEqual(infer_sheet_kind(lessons), "Расписание")
+
+    def test_missing_8d_lists_other_eighth_grades(self):
+        text = "\n".join([
+            "Расписание | СРЕДА | 8А | 1. 8.00 Алгебра",
+            "Расписание | СРЕДА | 8Б | 1. 8.00 История",
+            "Расписание | СРЕДА | 8В | 1. 8.00 Физика",
+            "Расписание | СРЕДА | 8Г | 1. 8.00 Химия",
+        ])
+        wednesday = datetime(2026, 9, 2, 12, 0, tzinfo=timezone(timedelta(hours=4)))
+        msg = format_day_schedule(text, class_filter="8Д", now=wednesday, week=True)
+        self.assertIn("8Д", msg)
+        self.assertIn("8А", msg)
+        self.assertIn("параллели", msg)
 
 
 if __name__ == "__main__":
