@@ -121,8 +121,8 @@ def schedule_keyboard() -> ReplyKeyboardMarkup:
         input_field_placeholder="класс 9Д  ·  Сегодня  ·  калл",
     )
 
-# сколько упоминаний в одном сообщении (Telegram не любит очень длинные)
-MENTIONS_PER_MESSAGE = 30
+# Telegram шлёт пуш только по первым 5 упоминаниям в одном сообщении
+MENTIONS_PER_MESSAGE = 5
 TELEGRAM_TEXT_LIMIT = 3500
 
 logging.basicConfig(level=logging.INFO)
@@ -208,8 +208,18 @@ def remember_user(chat_id: int, user, chat_type: str | None = None) -> None:
 
 
 def mention_html(uid: str, name: str, emoji: str) -> str:
-    # кликабельной ссылкой-упоминанием выступает сам эмодзи, ник не показываем
-    return f'<a href="tg://user?id={uid}">{emoji}</a>'
+    # уведомление приходит, только если в ссылке есть имя, не один эмодзи
+    label = escape((name or "user").strip() or "user")
+    mark = emoji or "•"
+    return f'<a href="tg://user?id={uid}">{mark} {label}</a>'
+
+
+def user_mentions(users: dict) -> list[str]:
+    return [
+        mention_html(uid, u.get("name", "user"), u.get("emoji", "•"))
+        for uid, u in users.items()
+        if str(uid).isdigit()
+    ]
 
 
 def _now_iso() -> str:
@@ -252,52 +262,45 @@ async def is_admin(message: Message, user_id: int) -> bool:
 async def do_call(message: Message, custom_text: str | None = None):
     """Тегает всех. Если передан custom_text — используем его как заголовок."""
     bucket = chat_bucket(message.chat.id)
-    users = bucket["users"]
+    mentions = user_mentions(bucket["users"])
 
-    if not users:
+    if not mentions:
         await message.reply(
             "Мне некого звать 🤷 Пусть участники напишут что-нибудь в чат "
             "или сделают /join, чтобы я их запомнил."
         )
         return
 
-    mentions = [
-        mention_html(uid, u["name"], u.get("emoji", "•"))
-        for uid, u in users.items()
-    ]
-
     header = custom_text.strip() if custom_text and custom_text.strip() else bucket["call_text"]
-    header = escape(header)  # текст от пользователя экранируем, чтобы не сломать HTML
-
-    for i in range(0, len(mentions), MENTIONS_PER_MESSAGE):
-        chunk = mentions[i : i + MENTIONS_PER_MESSAGE]
-        prefix = header + "\n" if i == 0 else ""
-        await message.answer(prefix + " ".join(chunk))
+    header = escape(header)
+    await send_mention_batches(message.chat.id, header, mentions)
+    await message.answer(
+        f"Позвал {len(mentions)}. Если кого-то нет — пусть напишет в чат или /join."
+    )
 
 
 async def ping_chat(chat_id: int, header: str) -> None:
-    bucket = chat_bucket(chat_id)
-    users = bucket["users"]
-    mentions = [
-        mention_html(uid, u["name"], u.get("emoji", "•"))
-        for uid, u in users.items()
-    ]
-    safe_header = escape(header)
+    mentions = user_mentions(chat_bucket(chat_id)["users"])
+    await send_mention_batches(chat_id, escape(header), mentions)
+
+
+async def send_mention_batches(chat_id: int, header: str, mentions: list[str]) -> None:
     if not mentions:
-        for part in _chunk_text(safe_header):
+        for part in _chunk_text(header):
             await bot.send_message(chat_id, part)
         return
     first = True
     for i in range(0, len(mentions), MENTIONS_PER_MESSAGE):
         chunk = mentions[i : i + MENTIONS_PER_MESSAGE]
         if first:
-            parts = _chunk_text(safe_header)
+            parts = _chunk_text(header)
             for j, part in enumerate(parts):
                 suffix = "\n" + " ".join(chunk) if j == len(parts) - 1 else ""
                 await bot.send_message(chat_id, part + suffix)
             first = False
         else:
             await bot.send_message(chat_id, " ".join(chunk))
+        await asyncio.sleep(0.05)
 
 
 def format_schedule_message(
@@ -553,7 +556,7 @@ HELP_TEXT = (
     "• каждые 2 часа с 8:00 проверяет сайт и зовёт всех, только если появились замены\n\n"
     "<b>Ещё:</b>\n"
     "• <code>/emoji 🔥</code> — свой эмодзи\n"
-    "• <code>/join</code> / <code>/leave</code> / <code>/who</code>\n"
+    "• <code>/join</code> / <code>/leave</code> / <code>/who</code> — список тех, кого зову\n"
     "• <code>/schoolstop</code> — выключить автосообщения\n\n"
     "⚠️ У @BotFather отключи Privacy Mode, иначе я не вижу сообщения в группе."
 )
@@ -657,7 +660,7 @@ async def cmd_who(message: Message):
         await message.reply("Пока никого не знаю. Пусть люди напишут /join.")
         return
     lines = [f"{u['emoji']} {escape(u['name'])}" for u in users.values()]
-    await message.reply("Знаю этих людей:\n" + "\n".join(lines))
+    await message.reply(f"Знаю {len(users)} человек:\n" + "\n".join(lines))
 
 
 def _http_url(raw: str) -> str | None:
@@ -886,10 +889,43 @@ async def text_schedule(message: Message):
     await cmd_raspisanie(message)
 
 
-# ловим любой текст, чтобы запоминать людей (идёт последним)
+# ловим любой текст, чтобы запоминать людей (идёт последним среди текстовых)
 @dp.message(F.text)
 async def remember_on_any_text(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
+
+
+@dp.message(F.new_chat_members)
+async def on_new_chat_members(message: Message):
+    for user in message.new_chat_members or []:
+        remember_user(message.chat.id, user, message.chat.type)
+
+
+@dp.message(F.left_chat_member)
+async def on_left_chat_member(message: Message):
+    user = message.left_chat_member
+    if user is None or user.is_bot:
+        return
+    bucket = chat_bucket(message.chat.id)
+    uid = str(user.id)
+    if uid in bucket["users"]:
+        del bucket["users"][uid]
+        save_data(data)
+
+
+@dp.chat_member()
+async def on_chat_member(event: ChatMemberUpdated):
+    user = event.new_chat_member.user
+    status = event.new_chat_member.status
+    if status in {"member", "administrator", "restricted", "creator"}:
+        remember_user(event.chat.id, user, event.chat.type)
+        return
+    if status in {"left", "kicked"}:
+        bucket = chat_bucket(event.chat.id)
+        uid = str(user.id)
+        if uid in bucket["users"]:
+            del bucket["users"][uid]
+            save_data(data)
 
 
 @dp.my_chat_member()
@@ -920,7 +956,7 @@ async def main():
         raise SystemExit("Укажи токен бота в переменной окружения BOT_TOKEN.")
     print("Бот запущен. Ctrl+C для остановки.")
     asyncio.create_task(schedule_loop())
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
