@@ -16,6 +16,13 @@ class BotModuleConstantsTests(unittest.TestCase):
         self.assertIn("DEFAULT_CALL_TEXT", names)
         self.assertIn("SCHEDULE_CHANGE_HEADER", names)
 
+    def test_call_mentions_are_named_and_batched_by_five(self):
+        src = (Path(__file__).resolve().parent / "bot.py").read_text(encoding="utf-8")
+        self.assertIn("MENTIONS_PER_MESSAGE = 5", src)
+        self.assertIn("{mark} {label}", src)
+        self.assertIn("tg://user?id=", src)
+        self.assertIn("allowed_updates", src)
+
 
 if __name__ == "__main__":
     unittest.main()
