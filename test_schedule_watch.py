@@ -340,6 +340,42 @@ class ScheduleParseTests(unittest.TestCase):
         self.assertIn("обновился", report.lower())
         self.assertNotIn("старая таблица", report)
 
+    def test_diff_ignores_other_classes_when_filter_set(self):
+        old_text = "\n".join([
+            "Изменения | ВТОРНИК | 8А | 2. 8.50 Русский",
+            "Изменения | ВТОРНИК | 9Д | 3. 9.50 Физика",
+        ])
+        new_text = "\n".join([
+            "Изменения | ВТОРНИК | 8А | 2. 8.50 Литература",
+            "Изменения | ВТОРНИК | 9Д | 3. 9.50 Физика",
+        ])
+        old = ScheduleSnapshot(source_url="u", text=old_text)
+        new = ScheduleSnapshot(source_url="u", text=new_text)
+        old.fingerprint = fingerprint_of(old)
+        new.fingerprint = fingerprint_of(new)
+        self.assertIsNone(describe_changes(old, new, class_filter="9Д"))
+        report = describe_changes(old, new, class_filter="8А")
+        self.assertIsNotNone(report)
+        self.assertIn("Литература", report)
+        self.assertIn("Русский", report)
+        self.assertNotIn("Физика", report)
+        self.assertNotIn("9Д", report)
+
+    def test_file_hash_change_is_silent_for_selected_class(self):
+        old = ScheduleSnapshot(
+            source_url="u",
+            text="Расписание | СРЕДА | 9Д | 1. 8.00 Алгебра",
+            files=[ScheduleFile("https://s/r.pdf", "Расписание", "aaa")],
+        )
+        new = ScheduleSnapshot(
+            source_url="u",
+            text="Расписание | СРЕДА | 9Д | 1. 8.00 Алгебра",
+            files=[ScheduleFile("https://s/r.pdf", "Расписание", "bbb")],
+        )
+        old.fingerprint = fingerprint_of(old)
+        new.fingerprint = fingerprint_of(new)
+        self.assertIsNone(describe_changes(old, new, class_filter="9Д"))
+
     def test_empty_today_hints_other_days(self):
         text = "Расписание | СРЕДА | 10а | 1. 8.00 Информатика"
         tuesday = datetime(2026, 9, 1, 12, 0, tzinfo=timezone(timedelta(hours=4)))

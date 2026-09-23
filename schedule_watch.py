@@ -603,6 +603,16 @@ def parse_lesson_line(line: str) -> tuple[str, str, str, str] | None:
     return parts[0], parts[1], parts[2], " | ".join(parts[3:])
 
 
+def line_matches_class_filter(line: str, class_filter: str) -> bool:
+    needles = [p for p in split_class_filters(class_filter) if p]
+    if not needles:
+        return True
+    parsed = parse_lesson_line(line)
+    if not parsed:
+        return False
+    return any(class_matches(parsed[2], needle) for needle in needles)
+
+
 def filter_lines_for_class(text: str, class_name: str) -> str:
     """Оставляет только строки уроков выбранного класса (точное совпадение 10А / 10а / 10A)."""
     needle = _norm_space(class_name)
@@ -610,8 +620,7 @@ def filter_lines_for_class(text: str, class_name: str) -> str:
         return text
     kept: list[str] = []
     for line in text.splitlines():
-        parsed = parse_lesson_line(line)
-        if parsed and class_matches(parsed[2], needle):
+        if line_matches_class_filter(line, needle):
             kept.append(line)
     return "\n".join(kept)
 
@@ -965,6 +974,7 @@ def _is_new_sosh_snapshot(snap: ScheduleSnapshot) -> bool:
 def describe_changes(
     old: ScheduleSnapshot | None,
     new: ScheduleSnapshot,
+    class_filter: str = "",
 ) -> str | None:
     if old is None:
         return None
@@ -975,6 +985,7 @@ def describe_changes(
         return "Сайт СОШ №46 обновился. Дальше слежу за новым расписанием и заменами."
 
     lines: list[str] = []
+    needles = [p for p in split_class_filters(class_filter) if p]
 
     old_files = {f.key(): f for f in old.files}
     new_files = {f.key(): f for f in new.files}
@@ -985,18 +996,20 @@ def describe_changes(
         for k in new_files
         if k in old_files and old_files[k].sha256 and new_files[k].sha256 and old_files[k].sha256 != new_files[k].sha256
     ]
-    if added_files:
-        lines.append("📄 Новые файлы:")
-        for f in added_files:
-            lines.append(f"• {f.title}\n  {f.url}")
-    if removed_files:
-        lines.append("🗑️ Файлы пропали:")
-        for f in removed_files:
-            lines.append(f"• {f.title}\n  {f.url}")
-    if updated_files:
-        lines.append("♻️ Файлы обновились (содержимое другое):")
-        for f in updated_files:
-            lines.append(f"• {f.title}\n  {f.url}")
+    # Файлы общие на всю школу — при выбранном классе это лишний флуд.
+    if not needles:
+        if added_files:
+            lines.append("📄 Новые файлы:")
+            for f in added_files:
+                lines.append(f"• {f.title}\n  {f.url}")
+        if removed_files:
+            lines.append("🗑️ Файлы пропали:")
+            for f in removed_files:
+                lines.append(f"• {f.title}\n  {f.url}")
+        if updated_files:
+            lines.append("♻️ Файлы обновились (содержимое другое):")
+            for f in updated_files:
+                lines.append(f"• {f.title}\n  {f.url}")
 
     old_set = [ln for ln in old.text.splitlines() if ln]
     new_set = [ln for ln in new.text.splitlines() if ln]
@@ -1006,6 +1019,9 @@ def describe_changes(
     removed = [ln for ln in old_set if ln not in new_uniq]
     added = [ln for ln in added if not ln.startswith("URL:") and not ln.startswith("Страница:")]
     removed = [ln for ln in removed if not ln.startswith("URL:") and not ln.startswith("Страница:")]
+    if needles:
+        added = [ln for ln in added if line_matches_class_filter(ln, class_filter)]
+        removed = [ln for ln in removed if line_matches_class_filter(ln, class_filter)]
 
     def clip(items: Iterable[str], limit: int = 18) -> list[str]:
         items = list(items)
