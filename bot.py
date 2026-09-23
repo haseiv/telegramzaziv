@@ -357,32 +357,40 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
         return f"Не смог открыть сайт школы: {escape(str(exc))}"
 
     old = ScheduleSnapshot.from_dict(sch.get("snapshot"))
-    diff = describe_changes(old, snap)
+    klass = sch.get("class_filter") or ""
+    # Снимок всегда полный, в чат — только выбранный класс, без школьного флуда.
+    diff = describe_changes(old, snap, class_filter=klass) if klass else None
     sch["last_check"] = _now_iso()
     sch["last_error"] = ""
     sch["snapshot"] = snap.to_dict()
     schedule_msg = format_schedule_message(
-        snap, sch.get("class_filter") or "", days_ahead=evening_days_ahead()
+        snap, klass, days_ahead=evening_days_ahead()
     )
 
     if old is None:
         save_data(data)
         if notify and watching(bucket):
-            klass = sch.get("class_filter") or ""
             if klass:
                 await send_plain(chat_id, schedule_msg, reply_markup=schedule_keyboard())
             else:
                 await send_plain(
                     chat_id,
-                    "Слежу за сайтом СОШ №46. Напишите <code>класс 9Д</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя.",
+                    "Слежу за сайтом СОШ №46. Напишите <code>класс 9Д</code> — дальше пришлю только этот класс.",
                     reply_markup=schedule_keyboard(),
                 )
             return "Запомнил расписание. Дальше напишу сам, если появятся замены."
         return "Снял первый снимок обычного расписания. Замены пришлю, когда их выложат.\n" + schedule_msg
 
+    if not klass:
+        save_data(data)
+        return (
+            "Проверил сайт. Изменения по всей школе не присылаю — "
+            "напишите <code>класс 9Д</code>, буду писать только про него."
+        )
+
     if not diff:
         save_data(data)
-        return "Проверил сайт: с прошлого раза расписание не менялось."
+        return f"Проверил сайт: для {klass} с прошлого раза ничего не менялось."
 
     sch["last_change"] = _now_iso()
     sch["last_diff"] = diff
@@ -391,7 +399,7 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
     if notify and watching(bucket):
         await ping_chat(chat_id, report)
         today = format_schedule_message(
-            snap, sch.get("class_filter") or "", days_ahead=0, week=False
+            snap, klass, days_ahead=0, week=False
         )
         await send_plain(chat_id, today, reply_markup=schedule_keyboard())
         return "Нашёл изменения на сайте и написал в чат."
