@@ -115,6 +115,13 @@ class ScheduleParseTests(unittest.TestCase):
         self.assertTrue(any(les.subject.startswith("История") and les.day == "ПОНЕДЕЛЬНИК" for les in eight))
         self.assertTrue(any(les.subject == "Алгебра" and les.day == "ЧЕТВЕРГ" for les in eight))
 
+    def test_csv_blank_header_column_keeps_class_alignment(self):
+        lessons = parse_timetable_csv("СРЕДА,,,,\n,,8А,,8Б\n08:00,1,Математика,,Физика")
+        self.assertEqual(
+            [(lesson.class_name, lesson.subject) for lesson in lessons],
+            [("8А", "Математика"), ("8Б", "Физика")],
+        )
+
     def test_format_thursday_for_class(self):
         lessons = parse_timetable_csv(CSV_SAMPLE, sheet="5-11 классы")
         text = "\n".join(les.line() for les in lessons)

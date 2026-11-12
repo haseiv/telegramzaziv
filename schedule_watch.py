@@ -447,14 +447,14 @@ def parse_timetable_csv(csv_text: str, sheet: str = "Расписание") -> l
             continue
         if cells and cells[0].lower().startswith(("кабинет", "педагог")):
             continue
-        if _is_class_header(cells) and (not cells[1] or not cells[1].isdigit()):
+        if _is_class_header(cells) and (len(cells) < 2 or not cells[1].isdigit()):
             # class names start after time/number columns
             start = 0
             if len(cells) >= 3 and not cells[0] and not cells[1]:
                 start = 2
             elif len(cells) >= 2 and not cells[0]:
                 start = 1
-            classes = [c for c in cells[start:] if c]
+            classes = cells[start:]
             continue
         if not classes:
             continue
@@ -468,7 +468,7 @@ def parse_timetable_csv(csv_text: str, sheet: str = "Расписание") -> l
         subjects = cells[2:] if len(cells) > 2 else []
         for i, class_name in enumerate(classes):
             subject = subjects[i] if i < len(subjects) else ""
-            if not subject:
+            if not class_name or not subject:
                 continue
             lessons.append(
                 Lesson(
@@ -1207,6 +1207,8 @@ async def collect_schedule(
                 pass
             snap.files.append(ScheduleFile(url=furl, title=title or furl, sha256=digest))
 
+        if not texts and not all_lessons:
+            raise RuntimeError("Источники расписания недоступны.")
         snap.text = "\n".join(t for t in texts if t)[:MAX_TEXT_CHARS]
         if all_lessons:
             snap.text = "\n".join(filter(None, (lessons_to_text(all_lessons), snap.text)))

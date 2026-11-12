@@ -140,10 +140,13 @@ def load_data() -> dict:
 
 
 def save_data(data: dict) -> None:
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = DATA_FILE.with_name(f"{DATA_FILE.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(DATA_FILE)
 
 
 data = load_data()
+schedule_locks: dict[int, asyncio.Lock] = {}
 
 
 def chat_bucket(chat_id: int) -> dict:
@@ -152,6 +155,7 @@ def chat_bucket(chat_id: int) -> dict:
         data[key] = {"call_text": DEFAULT_CALL_TEXT, "users": {}}
     data[key].setdefault("call_text", DEFAULT_CALL_TEXT)
     data[key].setdefault("users", {})
+    data[key].setdefault("mention_opt_out", {})
     data[key].setdefault("chat_type", "")
     data[key].setdefault("schedule", {})
     sch = data[key]["schedule"]
@@ -161,18 +165,13 @@ def chat_bucket(chat_id: int) -> dict:
     sch.setdefault("watch", not sch.get("stopped"))
     sch.setdefault("class_filter", SCHOOL_CLASS)
     sch.setdefault("snapshot", None)
+    sch.setdefault("notification_snapshot", sch["snapshot"])
     sch.setdefault("last_check", None)
     sch.setdefault("last_change", None)
     sch.setdefault("last_diff", "")
     sch.setdefault("last_error", "")
     sch.setdefault("last_daily", "")
     return data[key]
-
-
-def meta_bucket() -> dict:
-    bucket = data.setdefault("_meta", {})
-    bucket.setdefault("last_parse_slot", "")
-    return bucket
 
 
 def watching(bucket: dict) -> bool:
@@ -220,6 +219,13 @@ def user_mentions(users: dict) -> list[str]:
     ]
 
 
+def mentionable_users(bucket: dict) -> dict:
+    return {
+        uid: user for uid, user in bucket["users"].items()
+        if uid not in bucket["mention_opt_out"]
+    }
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -260,7 +266,7 @@ async def is_admin(message: Message, user_id: int) -> bool:
 async def do_call(message: Message, custom_text: str | None = None):
     """Тегает всех. Если передан custom_text — используем его как заголовок."""
     bucket = chat_bucket(message.chat.id)
-    mentions = user_mentions(bucket["users"])
+    mentions = user_mentions(mentionable_users(bucket))
 
     if not mentions:
         await message.reply(
@@ -278,7 +284,7 @@ async def do_call(message: Message, custom_text: str | None = None):
 
 
 async def ping_chat(chat_id: int, header: str) -> None:
-    mentions = user_mentions(chat_bucket(chat_id)["users"])
+    mentions = user_mentions(mentionable_users(chat_bucket(chat_id)))
     await send_mention_batches(chat_id, escape(header), mentions)
 
 
@@ -340,8 +346,33 @@ async def send_plain(chat_id: int, text: str, reply_markup=None) -> None:
 
 
 async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
+    lock = schedule_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        return await refresh_schedule_locked(chat_id, notify=notify)
+
+
+async def deliver_pending_schedule(chat_id: int, bucket: dict) -> bool:
+    sch = bucket["schedule"]
+    pending = sch.get("pending_notification")
+    if not pending or not watching(bucket):
+        return False
+    if pending.get("report"):
+        await ping_chat(chat_id, pending["report"])
+        pending.pop("report")
+        save_data(data)
+    if sch.get("pending_notification") is not pending or not watching(bucket):
+        return False
+    await send_plain(chat_id, pending["schedule"], reply_markup=schedule_keyboard())
+    if sch.get("pending_notification") is pending:
+        sch.pop("pending_notification")
+        save_data(data)
+    return True
+
+
+async def refresh_schedule_locked(chat_id: int, *, notify: bool) -> str:
     bucket = chat_bucket(chat_id)
     sch = bucket["schedule"]
+    delivered = notify and await deliver_pending_schedule(chat_id, bucket)
     url = (sch.get("url") or SCHOOL_URL or "").strip()
     if not url:
         return "Сайт школы ещё не задан."
@@ -353,56 +384,60 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
         )
     except Exception as exc:
         sch["last_check"] = _now_iso()
-        sch["last_error"] = str(exc)
+        sch["last_error"] = str(exc) or type(exc).__name__
         save_data(data)
         log.exception("Не удалось скачать расписание %s", url)
         return f"Не смог открыть сайт школы: {escape(str(exc))}"
 
-    old = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+    if url != sch.get("url"):
+        return "Адрес расписания изменился во время проверки."
+
+    old = ScheduleSnapshot.from_dict(sch.get("notification_snapshot"))
     klass = sch.get("class_filter") or ""
-    # Снимок всегда полный, в чат — только выбранный класс, без школьного флуда.
-    diff = describe_changes(old, snap, class_filter=klass) if klass else None
     sch["last_check"] = _now_iso()
     sch["last_error"] = ""
     sch["snapshot"] = snap.to_dict()
-    schedule_msg = format_schedule_message(
-        snap, klass, days_ahead=evening_days_ahead()
-    )
+    if notify or old is None:
+        sch["notification_snapshot"] = sch["snapshot"]
+    if not notify:
+        save_data(data)
+        return "Расписание обновлено."
 
     if old is None:
+        if watching(bucket):
+            sch["pending_notification"] = {
+                "schedule": format_schedule_message(snap, klass, days_ahead=evening_days_ahead()),
+            }
         save_data(data)
-        if notify and watching(bucket):
-            if klass:
-                await send_plain(chat_id, schedule_msg, reply_markup=schedule_keyboard())
-            else:
-                await send_plain(
-                    chat_id,
-                    "Слежу за сайтом СОШ №46. Напишите <code>класс 9Д</code> — дальше пришлю только этот класс.",
-                    reply_markup=schedule_keyboard(),
-                )
-            return "Запомнил расписание. Дальше напишу сам, если появятся замены."
-        return "Снял первый снимок обычного расписания. Замены пришлю, когда их выложат.\n" + schedule_msg
+        await deliver_pending_schedule(chat_id, bucket)
+        return "Запомнил расписание. Дальше напишу сам, если появятся замены."
 
     if not klass:
         save_data(data)
         return "Выберите класс, например <code>класс 9Д</code>, чтобы получать изменения."
 
+    diff = describe_changes(old, snap, class_filter=klass)
     if not diff:
         save_data(data)
+        if delivered:
+            return "Отправил ожидающее уведомление об изменениях."
         return f"Проверил сайт: для {escape(klass)} с прошлого раза ничего не менялось."
 
     sch["last_change"] = _now_iso()
     sch["last_diff"] = diff
-    save_data(data)
     report = f"{SCHEDULE_CHANGE_HEADER}\n{diff}"
-    if notify and watching(bucket):
-        await ping_chat(chat_id, report)
-        today = format_schedule_message(
-            snap, klass, days_ahead=0, week=False
-        )
-        await send_plain(chat_id, today, reply_markup=schedule_keyboard())
+    if watching(bucket):
+        sch["pending_notification"] = {
+            "report": report,
+            "schedule": format_schedule_message(snap, klass, days_ahead=0, week=False),
+        }
+        save_data(data)
+        await deliver_pending_schedule(chat_id, bucket)
         return "Нашёл изменения на сайте и написал в чат."
-    return report + "\n\n" + schedule_msg
+    save_data(data)
+    return escape(report) + "\n\n" + format_schedule_message(
+        snap, klass, days_ahead=evening_days_ahead(),
+    )
 
 
 async def send_daily_if_needed() -> bool:
@@ -464,13 +499,17 @@ async def send_scheduled_view(
     return retry
 
 
-async def check_all_chats() -> None:
+async def check_all_chats(slot_id: str) -> bool:
+    retry = False
     for key, bucket in list(data.items()):
         if key == "_meta" or not isinstance(bucket, dict):
             continue
         if not watching(bucket):
             continue
-        url = (bucket.get("schedule") or {}).get("url") or SCHOOL_URL
+        sch = bucket.get("schedule") or {}
+        if not sch.get("pending_notification") and (not slot_id or sch.get("last_parse_slot") == slot_id):
+            continue
+        url = sch.get("url") or SCHOOL_URL
         if not url:
             continue
         try:
@@ -479,8 +518,17 @@ async def check_all_chats() -> None:
             continue
         try:
             await refresh_schedule(chat_id, notify=True)
+            sch = chat_bucket(chat_id)["schedule"]
+            if sch.get("last_error"):
+                retry = True
+                continue
+            if slot_id:
+                sch["last_parse_slot"] = slot_id
+                save_data(data)
         except Exception:
+            retry = True
             log.exception("Проверка расписания для чата %s упала", key)
+    return retry
 
 
 def _parse_slot_kwargs() -> dict:
@@ -496,13 +544,8 @@ async def schedule_loop() -> None:
         try:
             now = school_now()
             due = last_due_parse_slot(now, **_parse_slot_kwargs())
-            meta = meta_bucket()
             slot_id = due.strftime("%Y-%m-%dT%H") if due else ""
-            if slot_id and meta.get("last_parse_slot") != slot_id:
-                log.info("Проверяю сайт школы, слот %s", slot_id)
-                await check_all_chats()
-                meta["last_parse_slot"] = slot_id
-                save_data(data)
+            retry_check = await check_all_chats(slot_id)
             retry_morning = await send_morning_if_needed()
             retry_daily = await send_daily_if_needed()
             nxt = min(
@@ -511,7 +554,7 @@ async def schedule_loop() -> None:
                 next_clock_at(DAILY_HOUR, 0),
             )
             delay = max(1.0, (nxt - school_now()).total_seconds() + 1)
-            if retry_morning or retry_daily:
+            if retry_check or retry_morning or retry_daily:
                 delay = min(delay, 60.0)
             log.info("Следующая задача в %s (через %.0f мин)", nxt.isoformat(), delay / 60)
             await asyncio.sleep(delay)
@@ -562,8 +605,10 @@ async def cmd_help(message: Message):
 
 @dp.message(Command("join"))
 async def cmd_join(message: Message):
+    bucket = chat_bucket(message.chat.id)
+    bucket["mention_opt_out"].pop(str(message.from_user.id), None)
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    emoji = chat_bucket(message.chat.id)["users"][str(message.from_user.id)]["emoji"]
+    emoji = bucket["users"][str(message.from_user.id)]["emoji"]
     await message.reply(f"Готово, добавил тебя в список {emoji}")
 
 
@@ -571,9 +616,10 @@ async def cmd_join(message: Message):
 async def cmd_leave(message: Message):
     bucket = chat_bucket(message.chat.id)
     uid = str(message.from_user.id)
-    if uid in bucket["users"]:
-        del bucket["users"][uid]
-        save_data(data)
+    was_mentioned = uid in bucket["users"] and uid not in bucket["mention_opt_out"]
+    bucket["mention_opt_out"][uid] = True
+    save_data(data)
+    if was_mentioned:
         await message.reply("Убрал тебя из списка 👋")
     else:
         await message.reply("Тебя и так нет в списке.")
@@ -647,7 +693,7 @@ async def cmd_calltext(message: Message, command: CommandObject):
 @dp.message(Command("who"))
 async def cmd_who(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
-    users = chat_bucket(message.chat.id)["users"]
+    users = mentionable_users(chat_bucket(message.chat.id))
     if not users:
         await message.reply("Пока никого не знаю. Пусть люди напишут /join.")
         return
@@ -683,6 +729,9 @@ async def cmd_schoolurl(message: Message, command: CommandObject):
     sch = chat_bucket(message.chat.id)["schedule"]
     sch["url"] = canonicalize_school_url(url)
     sch["snapshot"] = None
+    sch["notification_snapshot"] = None
+    sch.pop("pending_notification", None)
+    sch.pop("last_parse_slot", None)
     sch["last_diff"] = ""
     save_data(data)
     await message.reply(
@@ -703,11 +752,14 @@ async def apply_class_filter(message: Message, value: str) -> None:
         return
     if value.lower() in {"все", "всё", "-", "нет"}:
         sch["class_filter"] = ""
+        sch.pop("pending_notification", None)
         save_data(data)
         await message.reply("Фильтр класса снят.")
         return
     parts = [p for p in split_class_filters(value) if p]
     value = ", ".join(parts) or value
+    if sch.get("class_filter") != value:
+        sch.pop("pending_notification", None)
     sch["class_filter"] = value
     save_data(data)
     await refresh_schedule(message.chat.id, notify=False)
