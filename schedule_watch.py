@@ -383,7 +383,7 @@ def parse_next_flight_payload(html: str) -> dict:
 def snapshot_from_payload(payload: dict, source_url: str, pages: list[str]) -> ScheduleSnapshot:
     lessons, bells = parse_schedule_api(payload)
     snap = ScheduleSnapshot(source_url=source_url, pages=pages, bells=bells)
-    snap.text = lessons_to_text(lessons)[:MAX_TEXT_CHARS]
+    snap.text = lessons_to_text(lessons)
     if not snap.text:
         snap.text = "На сайте сейчас нет уроков."
     snap.fingerprint = fingerprint_of(snap)
@@ -520,18 +520,10 @@ def lesson_slot_key(item: Lesson) -> tuple:
 
 
 def merge_lessons(primary: list[Lesson], extra: list[Lesson]) -> list[Lesson]:
-    index = {lesson_slot_key(item): i for i, item in enumerate(primary)}
-    out = list(primary)
+    by_slot = {lesson_slot_key(item): item for item in primary}
     for item in extra:
-        key = lesson_slot_key(item)
-        if key not in index:
-            index[key] = len(out)
-            out.append(item)
-            continue
-        i = index[key]
-        if len(item.subject) > len(out[i].subject):
-            out[i] = item
-    return out
+        by_slot.setdefault(lesson_slot_key(item), item)
+    return list(by_slot.values())
 
 
 LAT_TO_CYR = str.maketrans({
@@ -603,6 +595,16 @@ def parse_lesson_line(line: str) -> tuple[str, str, str, str] | None:
     return parts[0], parts[1], parts[2], " | ".join(parts[3:])
 
 
+def line_matches_class_filter(line: str, class_filter: str) -> bool:
+    needles = [p for p in split_class_filters(class_filter) if p]
+    if not needles:
+        return True
+    parsed = parse_lesson_line(line)
+    if not parsed:
+        return False
+    return any(class_matches(parsed[2], needle) for needle in needles)
+
+
 def filter_lines_for_class(text: str, class_name: str) -> str:
     """Оставляет только строки уроков выбранного класса (точное совпадение 10А / 10а / 10A)."""
     needle = _norm_space(class_name)
@@ -610,8 +612,7 @@ def filter_lines_for_class(text: str, class_name: str) -> str:
         return text
     kept: list[str] = []
     for line in text.splitlines():
-        parsed = parse_lesson_line(line)
-        if parsed and class_matches(parsed[2], needle):
+        if line_matches_class_filter(line, needle):
             kept.append(line)
     return "\n".join(kept)
 
@@ -699,7 +700,8 @@ def format_day_schedule(
             f"{when.strftime('%d.%m.%Y')}"
         )
 
-    if not standard and not changes:
+    hint = ""
+    if not parsed_rows:
         other_days: list[str] = []
         if class_filter and not week:
             seen_days: set[str] = set()
@@ -713,47 +715,41 @@ def format_day_schedule(
                     other_days.append(day)
             if other_days:
                 shown = ", ".join(other_days)
-                return (
-                    f"{header}\nНа этот день в сетке пока пусто. "
-                    f"На сайте сейчас есть: {shown}.\n"
-                    f"Напишите «неделя», чтобы увидеть всё.\n"
-                    f"{DEFAULT_SCHOOL_URL}"
+                hint = (
+                    f"На этот день в сетке пока пусто. На сайте сейчас есть: {shown}.\n"
+                    "Напишите «неделя», чтобы увидеть всё."
                 )
-        if class_filter:
+        if class_filter and not hint:
             siblings = sibling_classes(class_filter, text)
             extra = (
                 f"Сейчас в параллели есть: {', '.join(siblings)}.\n"
                 if siblings
                 else "Проверьте написание (например 9Д).\n"
             )
-            return (
-                f"{header}\nВ таблице нет класса {class_filter}. {extra}"
-                f"{DEFAULT_SCHOOL_URL}"
-            )
-        return (
-            f"{header}\nВ стандартном расписании нет уроков. "
-            f"Напишите класс, например <code>класс 9Д</code>.\n"
-            f"{DEFAULT_SCHOOL_URL}"
-        )
+            hint = f"В таблице нет класса {class_filter}. {extra}".rstrip()
+        elif not class_filter:
+            hint = "Напишите класс, например <code>класс 9Д</code>."
 
-    chunks = [header]
+    chunks = [header, "\nУтвержденное:"]
     if standard:
-        chunks.append("\nОсновное расписание:")
         chunks.extend(_format_grouped_lessons(standard, by_day=week))
     else:
-        chunks.append("\nОсновное расписание на сайте сейчас пустое.")
+        chunks.append("В расписании на сайте пока нет уроков.")
 
+    chunks.append("\nИзмененное:")
     if changes:
-        chunks.append("\n⚠ Изменения (замены), если выложили:")
         chunks.extend(_format_grouped_lessons(changes, by_day=True))
-    elif class_filter:
-        chunks.append("\nЗамен на сайте сейчас нет.")
+    else:
+        chunks.append("Замен на сайте сейчас нет.")
+    if hint:
+        chunks.append("\n" + hint)
 
     body = "\n".join(chunks)
     return body + f"\n\nИсточник: {DEFAULT_SCHOOL_URL}"
 
 
 def format_changes_schedule(text: str, class_filter: str = "") -> str:
+    filters = [item for item in split_class_filters(class_filter) if item]
     rows: list[tuple[str, str, str, str]] = []
     for line in text.splitlines():
         parsed = parse_lesson_line(line)
@@ -762,7 +758,7 @@ def format_changes_schedule(text: str, class_filter: str = "") -> str:
         sheet, day, klass, lesson = parsed
         if not is_changes_sheet(sheet):
             continue
-        if class_filter and not class_matches(klass, class_filter):
+        if filters and not any(class_matches(klass, item) for item in filters):
             continue
         rows.append((sheet, day, klass, lesson))
     header = "⚠ Замены СОШ №46"
@@ -965,6 +961,7 @@ def _is_new_sosh_snapshot(snap: ScheduleSnapshot) -> bool:
 def describe_changes(
     old: ScheduleSnapshot | None,
     new: ScheduleSnapshot,
+    class_filter: str = "",
 ) -> str | None:
     if old is None:
         return None
@@ -975,6 +972,7 @@ def describe_changes(
         return "Сайт СОШ №46 обновился. Дальше слежу за новым расписанием и заменами."
 
     lines: list[str] = []
+    needles = [p for p in split_class_filters(class_filter) if p]
 
     old_files = {f.key(): f for f in old.files}
     new_files = {f.key(): f for f in new.files}
@@ -985,18 +983,20 @@ def describe_changes(
         for k in new_files
         if k in old_files and old_files[k].sha256 and new_files[k].sha256 and old_files[k].sha256 != new_files[k].sha256
     ]
-    if added_files:
-        lines.append("📄 Новые файлы:")
-        for f in added_files:
-            lines.append(f"• {f.title}\n  {f.url}")
-    if removed_files:
-        lines.append("🗑️ Файлы пропали:")
-        for f in removed_files:
-            lines.append(f"• {f.title}\n  {f.url}")
-    if updated_files:
-        lines.append("♻️ Файлы обновились (содержимое другое):")
-        for f in updated_files:
-            lines.append(f"• {f.title}\n  {f.url}")
+    # Файлы общие на всю школу — при выбранном классе это лишний флуд.
+    if not needles:
+        if added_files:
+            lines.append("📄 Новые файлы:")
+            for f in added_files:
+                lines.append(f"• {f.title}\n  {f.url}")
+        if removed_files:
+            lines.append("🗑️ Файлы пропали:")
+            for f in removed_files:
+                lines.append(f"• {f.title}\n  {f.url}")
+        if updated_files:
+            lines.append("♻️ Файлы обновились (содержимое другое):")
+            for f in updated_files:
+                lines.append(f"• {f.title}\n  {f.url}")
 
     old_set = [ln for ln in old.text.splitlines() if ln]
     new_set = [ln for ln in new.text.splitlines() if ln]
@@ -1006,6 +1006,9 @@ def describe_changes(
     removed = [ln for ln in old_set if ln not in new_uniq]
     added = [ln for ln in added if not ln.startswith("URL:") and not ln.startswith("Страница:")]
     removed = [ln for ln in removed if not ln.startswith("URL:") and not ln.startswith("Страница:")]
+    if needles:
+        added = [ln for ln in added if line_matches_class_filter(ln, class_filter)]
+        removed = [ln for ln in removed if line_matches_class_filter(ln, class_filter)]
 
     def clip(items: Iterable[str], limit: int = 18) -> list[str]:
         items = list(items)
@@ -1075,14 +1078,14 @@ async def collect_sosh46(session, ssl) -> ScheduleSnapshot | None:
     except Exception:
         log.exception("Не удалось прочитать %s", SOSH46_API_URL)
 
-    lessons = merge_lessons(sheet_lessons, api_lessons)
+    lessons = merge_lessons(api_lessons, sheet_lessons)
     if not lessons and not bells:
         return None
     snap = ScheduleSnapshot(
         source_url=DEFAULT_SCHOOL_URL,
         pages=pages or [DEFAULT_SCHOOL_URL],
         bells=bells,
-        text=lessons_to_text(lessons)[:MAX_TEXT_CHARS] or "На сайте сейчас нет уроков.",
+        text=lessons_to_text(lessons) or "На сайте сейчас нет уроков.",
     )
     snap.fingerprint = fingerprint_of(snap)
     return snap
@@ -1188,10 +1191,6 @@ async def collect_schedule(
             else:
                 texts.append(body[:4000])
 
-        lesson_text = lessons_to_text(all_lessons)
-        if lesson_text:
-            texts.insert(0, lesson_text)
-
         seen_files: set[str] = set()
         for furl, title in file_queue:
             key = furl.rstrip("/")
@@ -1209,6 +1208,8 @@ async def collect_schedule(
             snap.files.append(ScheduleFile(url=furl, title=title or furl, sha256=digest))
 
         snap.text = "\n".join(t for t in texts if t)[:MAX_TEXT_CHARS]
+        if all_lessons:
+            snap.text = "\n".join(filter(None, (lessons_to_text(all_lessons), snap.text)))
         snap.fingerprint = fingerprint_of(snap)
         return snap
     finally:

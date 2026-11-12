@@ -171,9 +171,7 @@ def chat_bucket(chat_id: int) -> dict:
 
 def meta_bucket() -> dict:
     bucket = data.setdefault("_meta", {})
-    bucket.setdefault("last_daily", "")
     bucket.setdefault("last_parse_slot", "")
-    bucket.setdefault("last_morning", "")
     return bucket
 
 
@@ -309,13 +307,17 @@ def format_schedule_message(
     *,
     days_ahead: int = 0,
     week: bool | None = None,
+    now: datetime | None = None,
 ) -> str:
+    if not class_filter:
+        return "Выберите класс, например <code>класс 9Д</code>, чтобы получить расписание."
     parts = []
     for klass in split_class_filters(class_filter):
         parts.append(
             format_day_schedule(
                 snap.text,
                 class_filter=klass,
+                now=now,
                 days_ahead=days_ahead,
                 week=week,
             )
@@ -357,32 +359,37 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
         return f"Не смог открыть сайт школы: {escape(str(exc))}"
 
     old = ScheduleSnapshot.from_dict(sch.get("snapshot"))
-    diff = describe_changes(old, snap)
+    klass = sch.get("class_filter") or ""
+    # Снимок всегда полный, в чат — только выбранный класс, без школьного флуда.
+    diff = describe_changes(old, snap, class_filter=klass) if klass else None
     sch["last_check"] = _now_iso()
     sch["last_error"] = ""
     sch["snapshot"] = snap.to_dict()
     schedule_msg = format_schedule_message(
-        snap, sch.get("class_filter") or "", days_ahead=evening_days_ahead()
+        snap, klass, days_ahead=evening_days_ahead()
     )
 
     if old is None:
         save_data(data)
         if notify and watching(bucket):
-            klass = sch.get("class_filter") or ""
             if klass:
                 await send_plain(chat_id, schedule_msg, reply_markup=schedule_keyboard())
             else:
                 await send_plain(
                     chat_id,
-                    "Слежу за сайтом СОШ №46. Напишите <code>класс 9Д</code> и жмите кнопки внизу: Сегодня, Завтра, Неделя.",
+                    "Слежу за сайтом СОШ №46. Напишите <code>класс 9Д</code> — дальше пришлю только этот класс.",
                     reply_markup=schedule_keyboard(),
                 )
             return "Запомнил расписание. Дальше напишу сам, если появятся замены."
         return "Снял первый снимок обычного расписания. Замены пришлю, когда их выложат.\n" + schedule_msg
 
+    if not klass:
+        save_data(data)
+        return "Выберите класс, например <code>класс 9Д</code>, чтобы получать изменения."
+
     if not diff:
         save_data(data)
-        return "Проверил сайт: с прошлого раза расписание не менялось."
+        return f"Проверил сайт: для {escape(klass)} с прошлого раза ничего не менялось."
 
     sch["last_change"] = _now_iso()
     sch["last_diff"] = diff
@@ -391,63 +398,37 @@ async def refresh_schedule(chat_id: int, *, notify: bool) -> str:
     if notify and watching(bucket):
         await ping_chat(chat_id, report)
         today = format_schedule_message(
-            snap, sch.get("class_filter") or "", days_ahead=0, week=False
+            snap, klass, days_ahead=0, week=False
         )
         await send_plain(chat_id, today, reply_markup=schedule_keyboard())
         return "Нашёл изменения на сайте и написал в чат."
     return report + "\n\n" + schedule_msg
 
 
-async def send_daily_if_needed() -> None:
+async def send_daily_if_needed() -> bool:
     now = school_now()
-    today = now.strftime("%Y-%m-%d")
-    meta = meta_bucket()
     if now.hour < DAILY_HOUR:
-        return
-    if meta.get("last_daily") == today:
-        return
-    meta["last_daily"] = today
-    save_data(data)
-    for key, bucket in list(data.items()):
-        if key == "_meta" or not isinstance(bucket, dict):
-            continue
-        if not watching(bucket):
-            continue
-        try:
-            chat_id = int(key)
-        except ValueError:
-            continue
-        sch = bucket.get("schedule") or {}
-        snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
-        if snap is None:
-            try:
-                await refresh_schedule(chat_id, notify=True)
-            except Exception:
-                log.exception("Вечерняя проверка расписания %s", key)
-            continue
-        try:
-            await send_plain(
-                chat_id,
-                format_schedule_message(
-                    snap, sch.get("class_filter") or "", days_ahead=1, week=False
-                ),
-                reply_markup=schedule_keyboard(),
-            )
-        except Exception:
-            log.exception("Не отправил вечернее расписание в %s", key)
+        return False
+    return await send_scheduled_view(now, marker="last_daily", days_ahead=1)
 
 
-async def send_morning_if_needed() -> None:
+async def send_morning_if_needed() -> bool:
     now = school_now()
-    today = now.strftime("%Y-%m-%d")
-    meta = meta_bucket()
     morning = now.replace(hour=MORNING_HOUR, minute=MORNING_MINUTE, second=0, microsecond=0)
     if now < morning:
-        return
-    if meta.get("last_morning") == today:
-        return
-    meta["last_morning"] = today
-    save_data(data)
+        return False
+    return await send_scheduled_view(
+        now, marker="last_morning", days_ahead=0,
+        prefix="☀️ Доброе утро. Расписание на сегодня:\n\n",
+    )
+
+
+async def send_scheduled_view(
+    now: datetime, *, marker: str, days_ahead: int, prefix: str = "",
+) -> bool:
+    """Возвращает True, если хотя бы одному чату ещё нужно доставить расписание."""
+    today = now.strftime("%Y-%m-%d")
+    retry = False
     for key, bucket in list(data.items()):
         if key == "_meta" or not isinstance(bucket, dict):
             continue
@@ -457,21 +438,30 @@ async def send_morning_if_needed() -> None:
             chat_id = int(key)
         except ValueError:
             continue
-        sch = bucket.get("schedule") or {}
-        snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
-        if snap is None:
+        sch = chat_bucket(chat_id)["schedule"]
+        if not sch.get("class_filter") or sch.get(marker) == today:
             continue
         try:
+            snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+            if snap is None:
+                await refresh_schedule(chat_id, notify=False)
+                snap = ScheduleSnapshot.from_dict(sch.get("snapshot"))
+            if snap is None:
+                retry = True
+                continue
             await send_plain(
                 chat_id,
-                "☀️ Доброе утро. Расписание на сегодня:\n\n"
-                + format_schedule_message(
-                    snap, sch.get("class_filter") or "", days_ahead=0, week=False
+                prefix + format_schedule_message(
+                    snap, sch.get("class_filter") or "", days_ahead=days_ahead, week=False, now=now
                 ),
                 reply_markup=schedule_keyboard(),
             )
+            sch[marker] = today
+            save_data(data)
         except Exception:
-            log.exception("Не отправил утреннее расписание в %s", key)
+            retry = True
+            log.exception("Не отправил расписание в %s", key)
+    return retry
 
 
 async def check_all_chats() -> None:
@@ -513,14 +503,16 @@ async def schedule_loop() -> None:
                 await check_all_chats()
                 meta["last_parse_slot"] = slot_id
                 save_data(data)
-            await send_morning_if_needed()
-            await send_daily_if_needed()
+            retry_morning = await send_morning_if_needed()
+            retry_daily = await send_daily_if_needed()
             nxt = min(
                 next_parse_at(school_now(), **_parse_slot_kwargs()),
                 next_clock_at(MORNING_HOUR, MORNING_MINUTE),
                 next_clock_at(DAILY_HOUR, 0),
             )
             delay = max(1.0, (nxt - school_now()).total_seconds() + 1)
+            if retry_morning or retry_daily:
+                delay = min(delay, 60.0)
             log.info("Следующая задача в %s (через %.0f мин)", nxt.isoformat(), delay / 60)
             await asyncio.sleep(delay)
         except Exception:
@@ -726,8 +718,7 @@ async def apply_class_filter(message: Message, value: str) -> None:
         await message.reply("Не смог скачать расписание с сайта школы.")
         return
     await message.reply(
-        f"Класс <b>{escape(value)}</b>. Это обычное расписание на неделю. "
-        "Замены пришлю отдельно, когда их выложат."
+        f"Выбран класс <b>{escape(value)}</b>. Расписание на неделю:"
     )
     for part in _chunk_text(format_schedule_message(snap, value, days_ahead=0, week=True)):
         await message.reply(part, reply_markup=schedule_keyboard())
@@ -829,6 +820,9 @@ async def cmd_bells(message: Message):
 async def cmd_izmeneniya(message: Message):
     remember_user(message.chat.id, message.from_user, message.chat.type)
     snap, klass = await ensure_snapshot(message.chat.id)
+    if not klass:
+        await message.reply("Выберите класс, например <code>класс 9Д</code>.")
+        return
     if not snap:
         await message.reply("Пока нет снимка с сайта. Напишите <code>класс 9Д</code>.")
         return

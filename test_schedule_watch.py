@@ -171,14 +171,15 @@ class ScheduleParseTests(unittest.TestCase):
         self.assertNotIn("Русский язык", msg)
         self.assertNotIn("Английский язык", msg)
 
-    def test_week_is_standard_and_skips_empty_changes(self):
+    def test_week_shows_both_sections_when_there_are_no_changes(self):
         lessons = parse_timetable_csv(CSV_SAMPLE, sheet="5-11 классы")
         text = "\n".join(les.line() for les in lessons)
         thursday = datetime(2026, 8, 27, 12, 0, tzinfo=timezone(timedelta(hours=4)))
         msg = format_day_schedule(text, class_filter="8А", now=thursday)
         self.assertIn("ПОНЕДЕЛЬНИК", msg)
         self.assertIn("ЧЕТВЕРГ", msg)
-        self.assertIn("Основное расписание", msg)
+        self.assertIn("Утвержденное:", msg)
+        self.assertIn("Измененное:", msg)
         self.assertIn("Замен на сайте сейчас нет", msg)
         self.assertIn("История", msg)
         self.assertIn("Алгебра", msg)
@@ -318,7 +319,7 @@ class ScheduleParseTests(unittest.TestCase):
         self.assertNotIn("Классные часы", msg)
         week = format_day_schedule(text, class_filter="10А", now=wednesday, week=True)
         self.assertIn("Классные часы", week)
-        self.assertIn("Изменения", week)
+        self.assertIn("Измененное:", week)
         self.assertIn("1 урок — 8.00 – 8.40", bells_to_text(payload["bells"]))
         self.assertIn("8.00", format_bells(bells, now=wednesday))
 
@@ -339,6 +340,42 @@ class ScheduleParseTests(unittest.TestCase):
         self.assertIsNotNone(report)
         self.assertIn("обновился", report.lower())
         self.assertNotIn("старая таблица", report)
+
+    def test_diff_ignores_other_classes_when_filter_set(self):
+        old_text = "\n".join([
+            "Изменения | ВТОРНИК | 8А | 2. 8.50 Русский",
+            "Изменения | ВТОРНИК | 9Д | 3. 9.50 Физика",
+        ])
+        new_text = "\n".join([
+            "Изменения | ВТОРНИК | 8А | 2. 8.50 Литература",
+            "Изменения | ВТОРНИК | 9Д | 3. 9.50 Физика",
+        ])
+        old = ScheduleSnapshot(source_url="u", text=old_text)
+        new = ScheduleSnapshot(source_url="u", text=new_text)
+        old.fingerprint = fingerprint_of(old)
+        new.fingerprint = fingerprint_of(new)
+        self.assertIsNone(describe_changes(old, new, class_filter="9Д"))
+        report = describe_changes(old, new, class_filter="8А")
+        self.assertIsNotNone(report)
+        self.assertIn("Литература", report)
+        self.assertIn("Русский", report)
+        self.assertNotIn("Физика", report)
+        self.assertNotIn("9Д", report)
+
+    def test_file_hash_change_is_silent_for_selected_class(self):
+        old = ScheduleSnapshot(
+            source_url="u",
+            text="Расписание | СРЕДА | 9Д | 1. 8.00 Алгебра",
+            files=[ScheduleFile("https://s/r.pdf", "Расписание", "aaa")],
+        )
+        new = ScheduleSnapshot(
+            source_url="u",
+            text="Расписание | СРЕДА | 9Д | 1. 8.00 Алгебра",
+            files=[ScheduleFile("https://s/r.pdf", "Расписание", "bbb")],
+        )
+        old.fingerprint = fingerprint_of(old)
+        new.fingerprint = fingerprint_of(new)
+        self.assertIsNone(describe_changes(old, new, class_filter="9Д"))
 
     def test_empty_today_hints_other_days(self):
         text = "Расписание | СРЕДА | 10а | 1. 8.00 Информатика"
